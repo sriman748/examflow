@@ -13,9 +13,9 @@ services:
       - key: JWT_SECRET
         generateValue: true
       - key: ADMIN_EMAIL
-        value: admin@institution.edu
+        sync: false
       - key: ADMIN_PASSWORD
-        value: ChangeMeAdmin2026!
+        sync: false
 
 databases:
   - name: examflow-db
