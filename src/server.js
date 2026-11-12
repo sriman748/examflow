@@ -15,10 +15,17 @@ const q=async(s,p,c=pool)=>{
   return(await c.query(s,p)).rows;
 };
 const app=express();app.use(helmet({contentSecurityPolicy:false}),express.json({limit:'20mb'}));
-app.use(express.static(__dirname+'/../public'));
-app.use(express.static(path.join(__dirname,'..')));
-app.get('/',(req,res)=>res.sendFile(path.join(__dirname,'../public/index.html')));
-app.get('/app.js',(req,res)=>res.sendFile(path.join(__dirname,'../public/app.js')));
+app.use(express.static(path.join(__dirname, '../public')));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', database: !!dbUrl, vercel: !!process.env.VERCEL }));
+
+app.use('/api', (req, res, next) => {
+  if (!dbUrl && req.path !== '/health') {
+    return res.status(503).json({
+      error: 'Database is not connected. Please connect a PostgreSQL database in Vercel (Storage tab -> Create Postgres).'
+    });
+  }
+  next();
+});
 
 // Rate limiting with support for shared campus IP / NAT
 const authKey = req => (req.headers.authorization || req.ip);
