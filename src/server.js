@@ -6,7 +6,7 @@ const express=require('express'),helmet=require('helmet'),rateLimit=require('exp
 const isLocalDb=!process.env.DATABASE_URL||process.env.DATABASE_URL.includes('localhost')||process.env.DATABASE_URL.includes('127.0.0.1');
 const pool=new Pool({
   connectionString:process.env.DATABASE_URL,
-  max:100,
+  max:process.env.VERCEL?10:100,
   ssl:isLocalDb?false:{rejectUnauthorized:false}
 }),SECRET=process.env.JWT_SECRET;
 if(!SECRET||SECRET.length<24)throw new Error('Set a strong JWT_SECRET');
@@ -689,4 +689,7 @@ app.get('/api/tests/:id/results',auth('admin','faculty'),h(async(req,res)=>{
   res.json({stats,rows})}));
 
 app.use((e,req,res,next)=>{console.error(e);res.status(500).json({error:'Server error'})});
-app.listen(process.env.PORT||3000,()=>console.log('ExamFlow API up on port '+(process.env.PORT||3000)));
+if(require.main===module){
+  app.listen(process.env.PORT||3000,()=>console.log('ExamFlow API up on port '+(process.env.PORT||3000)));
+}
+module.exports=app;
