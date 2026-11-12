@@ -760,7 +760,7 @@ app.use((e,req,res,next)=>{
   res.status(e.status||500).json({error:e.message||'Server error'});
 });
 
-if(require.main===module && !process.env.VERCEL){
+if(!process.env.VERCEL){
   const PORT=process.env.PORT||3000;
   app.listen(PORT,()=>console.log('ExamFlow API up on port '+PORT));
 }
