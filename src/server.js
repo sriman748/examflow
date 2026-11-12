@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express=require('express'),helmet=require('helmet'),rateLimit=require('express-rate-limit'),
   jwt=require('jsonwebtoken'),bcrypt=require('bcryptjs'),{Pool}=require('pg'),crypto=require('crypto'),
-  multer=require('multer'),pdfParse=require('pdf-parse'),mammoth=require('mammoth');
+  multer=require('multer'),pdfParse=require('pdf-parse'),mammoth=require('mammoth'),path=require('path');
 
 const dbUrl=process.env.DATABASE_URL||process.env.POSTGRES_URL;
 const isLocalDb=!dbUrl||dbUrl.includes('localhost')||dbUrl.includes('127.0.0.1');
@@ -16,6 +16,9 @@ const q=async(s,p,c=pool)=>{
 };
 const app=express();app.use(helmet({contentSecurityPolicy:false}),express.json({limit:'20mb'}));
 app.use(express.static(__dirname+'/../public'));
+app.use(express.static(path.join(__dirname,'..')));
+app.get('/',(req,res)=>res.sendFile(path.join(__dirname,'../public/index.html')));
+app.get('/app.js',(req,res)=>res.sendFile(path.join(__dirname,'../public/app.js')));
 
 // Rate limiting with support for shared campus IP / NAT
 const authKey = req => (req.headers.authorization || req.ip);
@@ -647,7 +650,9 @@ async function finalize(attemptId){
     await q('INSERT INTO results VALUES($1,$2,$3,$4,$5,$6,$7)',[attemptId,score,total,ok,bad,none,score>=a.pass_marks],c);
     await q('UPDATE attempts SET submitted_at=LEAST(now(),deadline) WHERE id=$1',[attemptId],c);await c.query('COMMIT')
   }catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}
-setInterval(()=>q('SELECT id FROM attempts WHERE submitted_at IS NULL AND deadline<now()').then(r=>Promise.all(r.map(x=>finalize(x.id)))).catch(console.error),15000);
+if(!process.env.VERCEL){
+  setInterval(()=>q('SELECT id FROM attempts WHERE submitted_at IS NULL AND deadline<now()').then(r=>Promise.all(r.map(x=>finalize(x.id)))).catch(console.error),15000);
+}
 
 app.post('/api/tests/:id/start',auth('student'),h(async(req,res)=>{
   const[t]=await q('SELECT t.* FROM tests t JOIN enrollments e ON e.course_id=t.course_id AND e.student_id=$2 WHERE t.id=$1 AND t.published',[req.params.id,req.user.id]);
