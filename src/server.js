@@ -1,19 +1,90 @@
 require('dotenv').config();
-const express=require('express'),helmet=require('helmet'),rateLimit=require('express-rate-limit'),
-  jwt=require('jsonwebtoken'),bcrypt=require('bcryptjs'),{Pool}=require('pg'),crypto=require('crypto'),
-  multer=require('multer'),pdfParse=require('pdf-parse'),mammoth=require('mammoth');
+const path = require('path');
+const express = require('express'), helmet = require('helmet'), rateLimit = require('express-rate-limit'),
+  jwt = require('jsonwebtoken'), bcrypt = require('bcryptjs'), { Pool } = require('pg'), crypto = require('crypto'),
+  multer = require('multer'), pdfParse = require('pdf-parse'), mammoth = require('mammoth');
 
-const pool=new Pool({connectionString:process.env.DATABASE_URL,max:100}),SECRET=process.env.JWT_SECRET;
-if(!SECRET||SECRET.length<24)throw new Error('Set a strong JWT_SECRET');
-const q=async(s,p,c=pool)=>(await c.query(s,p)).rows;
-const app=express();app.use(helmet({contentSecurityPolicy:false}),express.json({limit:'20mb'}));
-app.use(express.static(__dirname+'/../public'));
+const dbUrl = process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL || process.env.DATABASE_URL;
+let pool = null;
+if (dbUrl) {
+  const isLocalDb = dbUrl.includes('localhost') || dbUrl.includes('127.0.0.1');
+  pool = new Pool({
+    connectionString: dbUrl,
+    ssl: isLocalDb ? false : { rejectUnauthorized: false },
+    max: 20
+  });
+  pool.on('error', (err) => console.error('pg pool error:', err.message));
+}
+
+const SECRET = process.env.JWT_SECRET || 'examflow_jwt_secret_mvsrec_production_secure_token_2026';
+
+let migrationPromise = null;
+let migrated = false;
+
+const q = async (s, p, c = pool) => {
+  if (!c) {
+    const err = new Error('Database not configured. Please attach Vercel Postgres in Storage or set DATABASE_URL.');
+    err.status = 503;
+    throw err;
+  }
+  if (!migrated && !migrationPromise) {
+    migrationPromise = (async () => {
+      try {
+        const client = await c.connect();
+        try {
+          const res = await client.query("SELECT to_regclass('public.users') AS exists;");
+          if (!res.rows[0] || !res.rows[0].exists) {
+            console.log('[Auto-migrate] Running migration on first request...');
+            const migrate = require('./migrate');
+            await migrate();
+          }
+          migrated = true;
+        } finally {
+          client.release();
+        }
+      } catch (err) {
+        console.error('[Auto-migrate] Migration check error:', err.message);
+      }
+    })();
+  }
+  if (migrationPromise) {
+    await migrationPromise;
+  }
+  return (await c.query(s, p)).rows;
+};
+
+const app = express();
+app.set('trust proxy', 1);
+app.use(helmet({ contentSecurityPolicy: false }), express.json({ limit: '20mb' }));
+app.use(express.static(path.join(__dirname, '../public')));
+app.use(express.static(path.join(__dirname, '..')));
+
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    environment: process.env.VERCEL ? 'vercel-serverless' : 'local',
+    node: process.version,
+    database_connected: !!pool,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Database check middleware for all other /api routes
+app.use('/api', (req, res, next) => {
+  if (!pool && req.path !== '/health') {
+    return res.status(503).json({
+      error: 'Database is not connected. Please attach Vercel Postgres in the Vercel Storage tab or set DATABASE_URL.'
+    });
+  }
+  next();
+});
 
 // Rate limiting with support for shared campus IP / NAT
 const authKey = req => (req.headers.authorization || req.ip);
 app.use('/api/auth/login', rateLimit({ windowMs: 60000, max: 100, keyGenerator: req => req.ip }));
 app.use('/api', rateLimit({ windowMs: 60000, max: 3000, keyGenerator: authKey }));
-const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 const h=f=>(req,res,next)=>f(req,res,next).catch(next);
 const audit=(u,a,d)=>q('INSERT INTO audit_logs(user_id,action,detail) VALUES($1,$2,$3)',[u,a,d||{}]);
@@ -623,6 +694,7 @@ function isCorrect(qn,ans){if(ans==null||ans===''||(Array.isArray(ans)&&!ans.len
     case'fill':return c.some(x=>String(x).trim().toLowerCase()===String(ans).trim().toLowerCase());
     default:return null}}
 async function finalize(attemptId){
+  if(!pool)return;
   const c=await pool.connect();try{await c.query('BEGIN');
     const[a]=await q('SELECT a.*,t.pass_marks FROM attempts a JOIN tests t ON t.id=a.test_id WHERE a.id=$1 FOR UPDATE OF a',[attemptId],c);
     if(!a||a.submitted_at){await c.query('ROLLBACK');return}
@@ -633,7 +705,13 @@ async function finalize(attemptId){
     await q('INSERT INTO results VALUES($1,$2,$3,$4,$5,$6,$7)',[attemptId,score,total,ok,bad,none,score>=a.pass_marks],c);
     await q('UPDATE attempts SET submitted_at=LEAST(now(),deadline) WHERE id=$1',[attemptId],c);await c.query('COMMIT')
   }catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}
-setInterval(()=>q('SELECT id FROM attempts WHERE submitted_at IS NULL AND deadline<now()').then(r=>Promise.all(r.map(x=>finalize(x.id)))).catch(console.error),15000);
+
+if(!process.env.VERCEL){
+  setInterval(()=>{
+    if(!pool)return;
+    q('SELECT id FROM attempts WHERE submitted_at IS NULL AND deadline<now()').then(r=>Promise.all(r.map(x=>finalize(x.id)))).catch(console.error);
+  },15000);
+}
 
 app.post('/api/tests/:id/start',auth('student'),h(async(req,res)=>{
   const[t]=await q('SELECT t.* FROM tests t JOIN enrollments e ON e.course_id=t.course_id AND e.student_id=$2 WHERE t.id=$1 AND t.published',[req.params.id,req.user.id]);
@@ -677,5 +755,14 @@ app.get('/api/tests/:id/results',auth('admin','faculty'),h(async(req,res)=>{
     res.type('text/csv').send(['rank,name,email,score,total,correct,wrong,unattempted,passed',...rows.map(r=>[r.rank,r.name,r.email,r.score,r.total,r.correct,r.wrong,r.unattempted,r.passed].map(esc).join(','))].join('\n'));return}
   res.json({stats,rows})}));
 
-app.use((e,req,res,next)=>{console.error(e);res.status(500).json({error:'Server error'})});
-app.listen(process.env.PORT||3000,()=>console.log('ExamFlow API up on port '+(process.env.PORT||3000)));
+app.use((e,req,res,next)=>{
+  console.error(e);
+  res.status(e.status||500).json({error:e.message||'Server error'});
+});
+
+if(require.main===module && !process.env.VERCEL){
+  const PORT=process.env.PORT||3000;
+  app.listen(PORT,()=>console.log('ExamFlow API up on port '+PORT));
+}
+
+module.exports = app;
