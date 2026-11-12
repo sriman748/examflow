@@ -1775,7 +1775,10 @@ async function renderAdmin() {
 // ---------- FACULTY VIEW ----------
 async function renderFaculty() {
   const courses = await api('/courses');
-  if (!F.course && courses[0]) F.course = courses[0].id;
+  if (!F.course && courses.length > 0) {
+    const myCourse = (S.user && S.user.role === 'faculty') ? courses.find(c => c.faculty_id === S.user.id) : null;
+    F.course = myCourse ? myCourse.id : courses[0].id;
+  }
   
   if (F.course) {
     F.qs = await api(`/questions?course_id=${F.course}`);
