@@ -25,3 +25,4 @@ services:
         value: sriman_cse@mvsrec.edu.in
       - key: ADMIN_PASSWORD
         value: Sparky@748
+
