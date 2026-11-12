@@ -1,0 +1,6 @@
+node_modules
+pgdata
+pgsql
+.env
+.git
+*.log
