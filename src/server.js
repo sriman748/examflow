@@ -1,61 +1,19 @@
 require('dotenv').config();
 const express=require('express'),helmet=require('helmet'),rateLimit=require('express-rate-limit'),
   jwt=require('jsonwebtoken'),bcrypt=require('bcryptjs'),{Pool}=require('pg'),crypto=require('crypto'),
-  path=require('path');
+  multer=require('multer'),pdfParse=require('pdf-parse'),mammoth=require('mammoth');
 
-const dbUrl=process.env.DATABASE_URL||process.env.POSTGRES_URL;
-const isLocalDb=!dbUrl||dbUrl.includes('localhost')||dbUrl.includes('127.0.0.1');
-
-let pool=null;
-if(dbUrl){
-  pool=new Pool({
-    connectionString:dbUrl,
-    max:process.env.VERCEL?10:100,
-    ssl:isLocalDb?false:{rejectUnauthorized:false}
-  });
-  pool.on('error',err=>console.warn('[Database Pool Warning]:',err.message));
-}
-
-let uploadMiddleware=null;
-const getUpload=()=>{
-  if(!uploadMiddleware){
-    const multer=require('multer');
-    uploadMiddleware=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
-  }
-  return uploadMiddleware;
-};
-
-const SECRET=process.env.JWT_SECRET||'examflow_fallback_jwt_production_secret_key_minimum_24_chars_2026';
-const q=async(s,p,c=pool)=>{
-  if(!pool)throw new Error('Database connection is not configured. Please connect a PostgreSQL database in Vercel Storage.');
-  return(await (c||pool).query(s,p)).rows;
-};
+const pool=new Pool({connectionString:process.env.DATABASE_URL,max:100}),SECRET=process.env.JWT_SECRET;
+if(!SECRET||SECRET.length<24)throw new Error('Set a strong JWT_SECRET');
+const q=async(s,p,c=pool)=>(await c.query(s,p)).rows;
 const app=express();app.use(helmet({contentSecurityPolicy:false}),express.json({limit:'20mb'}));
-
-// Normalize URL pathing across Vercel serverless rewrites
-app.use((req, res, next) => {
-  if (req.originalUrl && req.originalUrl.startsWith('/api') && !req.url.startsWith('/api')) {
-    req.url = req.originalUrl;
-  }
-  next();
-});
-
-app.use(express.static(path.join(__dirname, '../public')));
-app.get('/api/health', (req, res) => res.json({ status: 'ok', database: !!dbUrl, vercel: !!process.env.VERCEL }));
-
-app.use('/api', (req, res, next) => {
-  if (!dbUrl && req.path !== '/health') {
-    return res.status(503).json({
-      error: 'Database is not connected. Please connect a PostgreSQL database in Vercel (Storage tab -> Create Postgres).'
-    });
-  }
-  next();
-});
+app.use(express.static(__dirname+'/../public'));
 
 // Rate limiting with support for shared campus IP / NAT
 const authKey = req => (req.headers.authorization || req.ip);
 app.use('/api/auth/login', rateLimit({ windowMs: 60000, max: 100, keyGenerator: req => req.ip }));
 app.use('/api', rateLimit({ windowMs: 60000, max: 3000, keyGenerator: authKey }));
+const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
 
 const h=f=>(req,res,next)=>f(req,res,next).catch(next);
 const audit=(u,a,d)=>q('INSERT INTO audit_logs(user_id,action,detail) VALUES($1,$2,$3)',[u,a,d||{}]);
@@ -82,8 +40,6 @@ const ownsQuestion=async(u,qid)=>{
     FROM questions q JOIN courses c ON c.id=q.course_id WHERE q.id=$1`,[qid]);
   return Boolean(qn&&(qn.created_by===u.id||qn.course_faculty_id===u.id));
 };
-
-const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
 
 // ---- HIGH-ACCURACY QUESTION EXTRACTOR ----
 function parseQuestionsFromText(rawText){
@@ -527,7 +483,7 @@ async function extractTextFromPDF(buffer){
 }
 
 // Smart File Extractor (PDF, DOCX, TXT)
-app.post('/api/questions/upload',auth('admin','faculty'),(req,res,next)=>getUpload().single('file')(req,res,next),h(async(req,res)=>{
+app.post('/api/questions/upload',auth('admin','faculty'),upload.single('file'),h(async(req,res)=>{
   if(!req.file)return res.status(400).json({error:'No document file uploaded'});
   const fname=(req.file.originalname||'').toLowerCase();
   let extractedText='';
@@ -683,9 +639,7 @@ async function finalize(attemptId){
     await q('INSERT INTO results VALUES($1,$2,$3,$4,$5,$6,$7)',[attemptId,score,total,ok,bad,none,score>=a.pass_marks],c);
     await q('UPDATE attempts SET submitted_at=LEAST(now(),deadline) WHERE id=$1',[attemptId],c);await c.query('COMMIT')
   }catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}
-if(!process.env.VERCEL){
-  setInterval(()=>q('SELECT id FROM attempts WHERE submitted_at IS NULL AND deadline<now()').then(r=>Promise.all(r.map(x=>finalize(x.id)))).catch(console.error),15000);
-}
+setInterval(()=>q('SELECT id FROM attempts WHERE submitted_at IS NULL AND deadline<now()').then(r=>Promise.all(r.map(x=>finalize(x.id)))).catch(console.error),15000);
 
 app.post('/api/tests/:id/start',auth('student'),h(async(req,res)=>{
   const[t]=await q('SELECT t.* FROM tests t JOIN enrollments e ON e.course_id=t.course_id AND e.student_id=$2 WHERE t.id=$1 AND t.published',[req.params.id,req.user.id]);
@@ -730,7 +684,4 @@ app.get('/api/tests/:id/results',auth('admin','faculty'),h(async(req,res)=>{
   res.json({stats,rows})}));
 
 app.use((e,req,res,next)=>{console.error(e);res.status(500).json({error:'Server error'})});
-if(require.main===module){
-  app.listen(process.env.PORT||3000,()=>console.log('ExamFlow API up on port '+(process.env.PORT||3000)));
-}
-module.exports=app;
+app.listen(process.env.PORT||3000,()=>console.log('ExamFlow API up on port '+(process.env.PORT||3000)));
