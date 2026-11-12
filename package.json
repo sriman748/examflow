@@ -1,11 +1,9 @@
 {
   "name": "examflow",
   "version": "1.0.0",
-  "engines": {
-    "node": "26.x"
-  },
+  "main": "run.js",
   "scripts": {
-    "dev": "node run.js",
+    "start": "node run.js",
     "seed": "node src/seed.js",
     "migrate": "node src/migrate.js"
   },

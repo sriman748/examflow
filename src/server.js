@@ -54,41 +54,8 @@ const q = async (s, p, c = pool) => {
 };
 
 const app = express();
-app.set('trust proxy', 1);
-
-// Normalize Vercel rewritten paths so Express routes match correctly
-app.use((req, res, next) => {
-  const matchedPath = req.headers['x-matched-path'] || req.headers['x-invoke-path'];
-  if (matchedPath) {
-    req.url = matchedPath;
-  }
-  next();
-});
-
 app.use(helmet({ contentSecurityPolicy: false }), express.json({ limit: '20mb' }));
 app.use(express.static(path.join(__dirname, '../public')));
-app.use(express.static(path.join(__dirname, '..')));
-
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    environment: process.env.VERCEL ? 'vercel-serverless' : 'local',
-    node: process.version,
-    database_connected: !!pool,
-    timestamp: new Date().toISOString()
-  });
-});
-
-// Database check middleware for all other /api routes
-app.use('/api', (req, res, next) => {
-  if (!pool && req.path !== '/health') {
-    return res.status(503).json({
-      error: 'Database is not connected. Please attach Vercel Postgres in the Vercel Storage tab or set DATABASE_URL.'
-    });
-  }
-  next();
-});
 
 // Rate limiting with support for shared campus IP / NAT
 const authKey = req => (req.headers.authorization || req.ip);
@@ -716,12 +683,10 @@ async function finalize(attemptId){
     await q('UPDATE attempts SET submitted_at=LEAST(now(),deadline) WHERE id=$1',[attemptId],c);await c.query('COMMIT')
   }catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}
 
-if(!process.env.VERCEL){
-  setInterval(()=>{
-    if(!pool)return;
-    q('SELECT id FROM attempts WHERE submitted_at IS NULL AND deadline<now()').then(r=>Promise.all(r.map(x=>finalize(x.id)))).catch(console.error);
-  },15000);
-}
+setInterval(()=>{
+  if(!pool)return;
+  q('SELECT id FROM attempts WHERE submitted_at IS NULL AND deadline<now()').then(r=>Promise.all(r.map(x=>finalize(x.id)))).catch(console.error);
+},15000);
 
 app.post('/api/tests/:id/start',auth('student'),h(async(req,res)=>{
   const[t]=await q('SELECT t.* FROM tests t JOIN enrollments e ON e.course_id=t.course_id AND e.student_id=$2 WHERE t.id=$1 AND t.published',[req.params.id,req.user.id]);
@@ -770,9 +735,7 @@ app.use((e,req,res,next)=>{
   res.status(e.status||500).json({error:e.message||'Server error'});
 });
 
-if(!process.env.VERCEL){
-  const PORT=process.env.PORT||3000;
-  app.listen(PORT,()=>console.log('ExamFlow API up on port '+PORT));
-}
+const PORT=process.env.PORT||3000;
+app.listen(PORT,()=>console.log('ExamFlow API up on port '+PORT));
 
 module.exports = app;
