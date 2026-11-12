@@ -17,3 +17,4 @@ ENV PORT=3000
 
 # Run migration & start server
 CMD ["sh", "-c", "node src/migrate.js && node src/seed.js && node src/server.js"]
+
