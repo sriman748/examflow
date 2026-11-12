@@ -55,6 +55,16 @@ const q = async (s, p, c = pool) => {
 
 const app = express();
 app.set('trust proxy', 1);
+
+// Normalize Vercel rewritten paths so Express routes match correctly
+app.use((req, res, next) => {
+  const matchedPath = req.headers['x-matched-path'] || req.headers['x-invoke-path'];
+  if (matchedPath) {
+    req.url = matchedPath;
+  }
+  next();
+});
+
 app.use(helmet({ contentSecurityPolicy: false }), express.json({ limit: '20mb' }));
 app.use(express.static(path.join(__dirname, '../public')));
 app.use(express.static(path.join(__dirname, '..')));
