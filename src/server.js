@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express=require('express'),helmet=require('helmet'),rateLimit=require('express-rate-limit'),
   jwt=require('jsonwebtoken'),bcrypt=require('bcryptjs'),{Pool}=require('pg'),crypto=require('crypto'),
-  multer=require('multer'),pdfParse=require('pdf-parse'),mammoth=require('mammoth'),path=require('path');
+  path=require('path');
 
 const dbUrl=process.env.DATABASE_URL||process.env.POSTGRES_URL;
 const isLocalDb=!dbUrl||dbUrl.includes('localhost')||dbUrl.includes('127.0.0.1');
@@ -16,22 +16,18 @@ if(dbUrl){
   pool.on('error',err=>console.warn('[Database Pool Warning]:',err.message));
 }
 
-let migrationAttempted=false;
-async function checkSchema(){
-  if(migrationAttempted||!pool)return;
-  try{
-    const migrate=require('./migrate');
-    await migrate();
-    migrationAttempted=true;
-  }catch(e){
-    console.warn('[Auto-Schema Warning]:',e.message);
+let uploadMiddleware=null;
+const getUpload=()=>{
+  if(!uploadMiddleware){
+    const multer=require('multer');
+    uploadMiddleware=multer({storage:multer.memoryStorage(),limits:{fileSize:20*1024*1024}});
   }
-}
+  return uploadMiddleware;
+};
 
 const SECRET=process.env.JWT_SECRET||'examflow_fallback_jwt_production_secret_key_minimum_24_chars_2026';
 const q=async(s,p,c=pool)=>{
   if(!pool)throw new Error('Database connection is not configured. Please connect a PostgreSQL database in Vercel Storage.');
-  await checkSchema();
   return(await (c||pool).query(s,p)).rows;
 };
 const app=express();app.use(helmet({contentSecurityPolicy:false}),express.json({limit:'20mb'}));
@@ -531,7 +527,7 @@ async function extractTextFromPDF(buffer){
 }
 
 // Smart File Extractor (PDF, DOCX, TXT)
-app.post('/api/questions/upload',auth('admin','faculty'),upload.single('file'),h(async(req,res)=>{
+app.post('/api/questions/upload',auth('admin','faculty'),(req,res,next)=>getUpload().single('file')(req,res,next),h(async(req,res)=>{
   if(!req.file)return res.status(400).json({error:'No document file uploaded'});
   const fname=(req.file.originalname||'').toLowerCase();
   let extractedText='';
@@ -540,6 +536,7 @@ app.post('/api/questions/upload',auth('admin','faculty'),upload.single('file'),h
     if(fname.endsWith('.pdf')||req.file.mimetype==='application/pdf'){
       extractedText=await extractTextFromPDF(req.file.buffer);
     }else if(fname.endsWith('.docx')||fname.endsWith('.doc')||req.file.mimetype.includes('word')){
+      const mammoth=require('mammoth');
       const docxData=await mammoth.extractRawText({buffer:req.file.buffer});
       extractedText=docxData.value||'';
     }else{
