@@ -3,9 +3,10 @@ const express=require('express'),helmet=require('helmet'),rateLimit=require('exp
   jwt=require('jsonwebtoken'),bcrypt=require('bcryptjs'),{Pool}=require('pg'),crypto=require('crypto'),
   multer=require('multer'),pdfParse=require('pdf-parse'),mammoth=require('mammoth');
 
-const isLocalDb=!process.env.DATABASE_URL||process.env.DATABASE_URL.includes('localhost')||process.env.DATABASE_URL.includes('127.0.0.1');
+const dbUrl=process.env.DATABASE_URL||process.env.POSTGRES_URL;
+const isLocalDb=!dbUrl||dbUrl.includes('localhost')||dbUrl.includes('127.0.0.1');
 const pool=new Pool({
-  connectionString:process.env.DATABASE_URL,
+  connectionString:dbUrl,
   max:process.env.VERCEL?10:100,
   ssl:isLocalDb?false:{rejectUnauthorized:false}
 }),SECRET=process.env.JWT_SECRET;
