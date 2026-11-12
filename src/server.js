@@ -15,6 +15,15 @@ const q=async(s,p,c=pool)=>{
   return(await c.query(s,p)).rows;
 };
 const app=express();app.use(helmet({contentSecurityPolicy:false}),express.json({limit:'20mb'}));
+
+// Normalize URL pathing across Vercel serverless rewrites
+app.use((req, res, next) => {
+  if (req.originalUrl && req.originalUrl.startsWith('/api') && !req.url.startsWith('/api')) {
+    req.url = req.originalUrl;
+  }
+  next();
+});
+
 app.use(express.static(path.join(__dirname, '../public')));
 app.get('/api/health', (req, res) => res.json({ status: 'ok', database: !!dbUrl, vercel: !!process.env.VERCEL }));
 
