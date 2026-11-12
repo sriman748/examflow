@@ -57,6 +57,16 @@ const app = express();
 app.use(helmet({ contentSecurityPolicy: false }), express.json({ limit: '20mb' }));
 app.use(express.static(path.join(__dirname, '../public')));
 
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    environment: process.env.NODE_ENV || 'development',
+    database_connected: !!pool,
+    timestamp: new Date().toISOString()
+  });
+});
+
 // Rate limiting with support for shared campus IP / NAT
 const authKey = req => (req.headers.authorization || req.ip);
 app.use('/api/auth/login', rateLimit({ windowMs: 60000, max: 100, keyGenerator: req => req.ip }));

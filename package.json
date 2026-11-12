@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "main": "run.js",
   "scripts": {
-    "start": "node run.js",
+    "start": "node src/migrate.js && node src/server.js",
+    "dev": "node run.js",
     "seed": "node src/seed.js",
     "migrate": "node src/migrate.js"
   },
