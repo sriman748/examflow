@@ -5,14 +5,34 @@ const express=require('express'),helmet=require('helmet'),rateLimit=require('exp
 
 const dbUrl=process.env.DATABASE_URL||process.env.POSTGRES_URL;
 const isLocalDb=!dbUrl||dbUrl.includes('localhost')||dbUrl.includes('127.0.0.1');
-const pool=new Pool({
-  connectionString:dbUrl,
-  max:process.env.VERCEL?10:100,
-  ssl:isLocalDb?false:{rejectUnauthorized:false}
-}),SECRET=process.env.JWT_SECRET||'examflow_fallback_jwt_production_secret_key_minimum_24_chars_2026';
+
+let pool=null;
+if(dbUrl){
+  pool=new Pool({
+    connectionString:dbUrl,
+    max:process.env.VERCEL?10:100,
+    ssl:isLocalDb?false:{rejectUnauthorized:false}
+  });
+  pool.on('error',err=>console.warn('[Database Pool Warning]:',err.message));
+}
+
+let migrationAttempted=false;
+async function checkSchema(){
+  if(migrationAttempted||!pool)return;
+  try{
+    const migrate=require('./migrate');
+    await migrate();
+    migrationAttempted=true;
+  }catch(e){
+    console.warn('[Auto-Schema Warning]:',e.message);
+  }
+}
+
+const SECRET=process.env.JWT_SECRET||'examflow_fallback_jwt_production_secret_key_minimum_24_chars_2026';
 const q=async(s,p,c=pool)=>{
-  if(!dbUrl)throw new Error('Database connection is not configured. Please set DATABASE_URL or connect Vercel Postgres in Storage tab.');
-  return(await c.query(s,p)).rows;
+  if(!pool)throw new Error('Database connection is not configured. Please connect a PostgreSQL database in Vercel Storage.');
+  await checkSchema();
+  return(await (c||pool).query(s,p)).rows;
 };
 const app=express();app.use(helmet({contentSecurityPolicy:false}),express.json({limit:'20mb'}));
 
