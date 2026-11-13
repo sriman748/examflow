@@ -102,6 +102,7 @@ function logout() {
   if (saverInterval) clearInterval(saverInterval);
   E = null;
   activeTab = 0;
+  invalidateCache();
   window.location.hash = '';
   render();
   toast('Logged out successfully');
@@ -112,15 +113,56 @@ function setAuth(token, user) {
   S.user = user;
   localStorage.setItem('ef_token', token);
   localStorage.setItem('ef_user', JSON.stringify(user));
+  invalidateCache();
   render();
 }
 
-function setAuth(token, user) {
-  S.token = token;
-  S.user = user;
-  localStorage.setItem('ef_token', token);
-  localStorage.setItem('ef_user', JSON.stringify(user));
-  render();
+// In-Memory Data Cache for buttery smooth, zero-lag tab transitions
+const CACHE = { courses: null, users: null, tests: null, qs: {}, candidates: {} };
+async function getCachedCourses(force = false) {
+  if (!CACHE.courses || force) CACHE.courses = await api('/courses');
+  return CACHE.courses;
+}
+async function getCachedUsers(force = false) {
+  if (!CACHE.users || force) CACHE.users = await api('/users');
+  return CACHE.users;
+}
+async function getCachedTests(force = false) {
+  if (!CACHE.tests || force) CACHE.tests = await api('/tests');
+  return CACHE.tests;
+}
+async function getCachedCandidates(courseId, force = false) {
+  if (!CACHE.candidates[courseId] || force) {
+    CACHE.candidates[courseId] = await api(`/courses/${courseId}/enrollment-candidates`);
+  }
+  return CACHE.candidates[courseId];
+}
+function invalidateCache(key) {
+  if (key) {
+    CACHE[key] = null;
+    if (key === 'courses') CACHE.candidates = {};
+  } else {
+    CACHE.courses = null; CACHE.users = null; CACHE.tests = null; CACHE.qs = {}; CACHE.candidates = {};
+  }
+}
+
+// Batch Enrollment State
+let batchEnrollCourseId = null;
+let batchEnrollCandidates = [];
+let batchSelectedStudents = new Set();
+let batchBranchFilter = 'all';
+let batchStatusFilter = 'unenrolled';
+let batchSearchQuery = '';
+
+// Branch Badge Helper
+function getBranchBadge(dept = '') {
+  const d = (dept || '').toUpperCase().trim();
+  if (d.includes('CSE') || d.includes('COMPUTER')) return { cls: 'branch-cse', label: d || 'CSE' };
+  if (d.includes('ECE') || d.includes('ELECTRONIC')) return { cls: 'branch-ece', label: d || 'ECE' };
+  if (d.includes('IT') || d.includes('INFO')) return { cls: 'branch-it', label: d || 'IT' };
+  if (d.includes('MECH')) return { cls: 'branch-mech', label: d || 'MECH' };
+  if (d.includes('CIVIL')) return { cls: 'branch-civil', label: d || 'CIVIL' };
+  return { cls: 'branch-gen', label: d || 'General' };
 }
 
 // Global SVG Icons
@@ -1461,9 +1503,9 @@ async function renderJoinPage(code) {
 // ---------- ADMIN VIEW ----------
 async function renderAdmin() {
   const [users, courses, tests] = await Promise.all([
-    api('/users'),
-    api('/courses'),
-    api('/tests')
+    getCachedUsers(),
+    getCachedCourses(),
+    getCachedTests()
   ]);
 
   const tabs = [
@@ -1606,6 +1648,43 @@ async function renderAdmin() {
       </div>
     `;
   } else if (activeTab === 2) {
+    if (!batchEnrollCourseId && courses.length > 0) {
+      batchEnrollCourseId = courses[0].id;
+    }
+    let candidates = [];
+    if (batchEnrollCourseId) {
+      try {
+        candidates = await getCachedCandidates(batchEnrollCourseId);
+      } catch (e) {
+        candidates = [];
+      }
+    }
+
+    const deptMap = {};
+    candidates.forEach(s => {
+      const d = (s.department || 'General').trim();
+      deptMap[d] = (deptMap[d] || 0) + 1;
+    });
+    const branchOptions = Object.keys(deptMap).sort().map(d => ({ name: d, count: deptMap[d] }));
+    const enrolledInCourseCount = candidates.filter(s => s.enrolled).length;
+    const unenrolledCount = candidates.length - enrolledInCourseCount;
+    const curCourse = courses.find(c => c.id == batchEnrollCourseId);
+
+    const filteredCandidates = candidates.filter(s => {
+      if (batchBranchFilter !== 'all') {
+        const d = (s.department || 'General').trim().toLowerCase();
+        if (d !== batchBranchFilter.toLowerCase()) return false;
+      }
+      if (batchStatusFilter === 'unenrolled' && s.enrolled) return false;
+      if (batchStatusFilter === 'enrolled' && !s.enrolled) return false;
+      if (batchSearchQuery) {
+        const q = batchSearchQuery.toLowerCase().trim();
+        const txt = (s.name + ' ' + s.email + ' ' + (s.roll_number || '') + ' ' + (s.department || '')).toLowerCase();
+        if (!txt.includes(q)) return false;
+      }
+      return true;
+    });
+
     tabContent = `
       <div class="card">
         <div class="card-header">
@@ -1640,31 +1719,133 @@ async function renderAdmin() {
         </form>
       </div>
 
-      <div class="card">
-        <div class="card-header">
+      <!-- SMART BATCH STUDENT ENROLLMENT SUITE -->
+      <div class="card" id="batch-enrollment-card">
+        <div class="card-header" style="flex-wrap: wrap; gap: 1rem; justify-content: space-between; align-items: center;">
           <div>
-            <div class="card-title">Batch Student Enrollment</div>
-            <div class="card-subtitle">Assign students to a course by their User IDs</div>
+            <div class="card-title">👥 Smart Batch Student Enrollment</div>
+            <div class="card-subtitle">Filter by branch, view student profiles & enroll whole classes with 1 click</div>
           </div>
-        </div>
-        <form data-f="enroll" class="form-row">
-          <div>
-            <label class="form-label">Target Course</label>
-            <select name="course_id" class="form-control" required>
-              <option value="">Select Course...</option>
+          <div style="display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap;">
+            <label style="font-weight: 700; font-size: 0.88rem; color: var(--text-main);">Target Course:</label>
+            <select id="batch-course-select" class="form-control" style="min-width: 280px; font-weight: 700;">
               ${courses.map(c => `
-                <option value="${c.id}">${esc(c.code)} - ${esc(c.name)}</option>
+                <option value="${c.id}" ${c.id == batchEnrollCourseId ? 'selected' : ''}>
+                  ${esc(c.code)} - ${esc(c.name)} (${c.students_count || 0} enrolled)
+                </option>
               `).join('')}
             </select>
           </div>
-          <div style="grid-column: span 2;">
-            <label class="form-label">Student IDs (Comma Separated)</label>
-            <input type="text" name="student_ids" class="form-control" placeholder="e.g. 2, 4, 7, 9" required>
+        </div>
+
+        <!-- Student Metrics Summary -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 0.75rem; margin-bottom: 1.25rem;">
+          <div style="background: var(--surface-subtle); padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border);">
+            <div class="text-xs text-muted">Total Active Students</div>
+            <div style="font-size: 1.35rem; font-weight: 800; color: var(--text-main);">${candidates.length}</div>
           </div>
-          <div style="display: flex; align-items: flex-end;">
-            <button type="submit" class="btn btn-primary" style="width: 100%;">Enroll Batch</button>
+          <div style="background: #ecfdf5; padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid #a7f3d0;">
+            <div class="text-xs text-muted" style="color: #065f46;">Already Enrolled</div>
+            <div style="font-size: 1.35rem; font-weight: 800; color: #047857;">${enrolledInCourseCount}</div>
           </div>
-        </form>
+          <div style="background: #eff6ff; padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid #bfdbfe;">
+            <div class="text-xs text-muted" style="color: #1e40af;">Eligible (Unenrolled)</div>
+            <div style="font-size: 1.35rem; font-weight: 800; color: #1d4ed8;">${unenrolledCount}</div>
+          </div>
+          <div style="background: #fdf4ff; padding: 0.75rem 1rem; border-radius: var(--radius-sm); border: 1px solid #f5d0fe;">
+            <div class="text-xs text-muted" style="color: #86198f;">Currently Selected</div>
+            <div style="font-size: 1.35rem; font-weight: 800; color: #a21caf;" id="batch-selected-count-badge">${batchSelectedStudents.size}</div>
+          </div>
+        </div>
+
+        <!-- Filters & Toolbar -->
+        <div style="background: var(--surface-subtle); padding: 0.85rem 1rem; border-radius: var(--radius-sm); border: 1px solid var(--border); margin-bottom: 1rem;">
+          <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; justify-content: space-between;">
+            <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center; flex: 1;">
+              <input type="text" id="batch-search-input" placeholder="🔍 Search student, roll no, branch..." 
+                class="form-control" style="min-width: 220px; font-size: 0.85rem;" value="${esc(batchSearchQuery)}">
+              
+              <select id="batch-branch-select" class="form-control" style="width: auto; font-size: 0.85rem; font-weight: 600;">
+                <option value="all">All Branches / Depts (${candidates.length})</option>
+                ${branchOptions.map(b => `<option value="${esc(b.name)}" ${batchBranchFilter.toLowerCase() === b.name.toLowerCase() ? 'selected' : ''}>🏛️ ${esc(b.name)} (${b.count})</option>`).join('')}
+              </select>
+
+              <select id="batch-status-select" class="form-control" style="width: auto; font-size: 0.85rem; font-weight: 600;">
+                <option value="unenrolled" ${batchStatusFilter === 'unenrolled' ? 'selected' : ''}>🎯 Unenrolled Only (${unenrolledCount})</option>
+                <option value="all" ${batchStatusFilter === 'all' ? 'selected' : ''}>All Students (${candidates.length})</option>
+                <option value="enrolled" ${batchStatusFilter === 'enrolled' ? 'selected' : ''}>✓ Already Enrolled (${enrolledInCourseCount})</option>
+              </select>
+            </div>
+            <div style="display: flex; gap: 0.5rem; align-items: center;">
+              <button type="button" class="btn btn-sm btn-outline" data-a="batch-select-all-filtered">☑️ Select Filtered</button>
+              <button type="button" class="btn btn-sm btn-outline" data-a="batch-clear-all-selected">⬜ Clear</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Candidate Students Table -->
+        <div class="table-responsive" style="max-height: 400px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius-sm);">
+          <table>
+            <thead style="position: sticky; top: 0; background: var(--surface); z-index: 5;">
+              <tr>
+                <th style="width: 40px; text-align: center;">
+                  <input type="checkbox" id="batch-check-all" style="cursor: pointer; transform: scale(1.15);">
+                </th>
+                <th>Roll Number</th>
+                <th>Student Name & Email</th>
+                <th>Branch / Dept</th>
+                <th>Semester</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="batch-candidates-tbody">
+              ${filteredCandidates.length ? filteredCandidates.map(s => {
+                const bInfo = getBranchBadge(s.department);
+                const isSelected = batchSelectedStudents.has(s.id);
+                return `
+                  <tr style="background: ${isSelected ? 'rgba(79, 70, 229, 0.04)' : ''};">
+                    <td style="text-align: center;">
+                      <input type="checkbox" class="batch-student-cb" data-id="${s.id}" ${isSelected ? 'checked' : ''} style="cursor: pointer; transform: scale(1.15);">
+                    </td>
+                    <td>
+                      <code style="font-size: 0.85rem; font-weight: 700;">${esc(s.roll_number || 'N/A')}</code>
+                    </td>
+                    <td>
+                      <strong>${esc(s.name)}</strong>
+                      <div class="text-xs text-muted">${esc(s.email)}</div>
+                    </td>
+                    <td>
+                      <span class="branch-badge ${bInfo.cls}">${esc(bInfo.label)}</span>
+                    </td>
+                    <td><span class="text-sm text-muted">${esc(s.year_sem || '—')}</span></td>
+                    <td>
+                      ${s.enrolled 
+                        ? `<span class="badge badge-success" title="Enrolled on ${s.enrolled_at ? new Date(s.enrolled_at).toLocaleDateString() : ''}">✓ Enrolled</span>`
+                        : `<span class="badge" style="background: var(--surface-subtle); color: var(--text-muted);">Not Enrolled</span>`
+                      }
+                    </td>
+                  </tr>
+                `;
+              }).join('') : `
+                <tr>
+                  <td colspan="6" class="text-center text-muted" style="padding: 2.5rem;">
+                    No students match the current branch/search criteria.
+                  </td>
+                </tr>
+              `}
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Action Submit Bar -->
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 1.25rem; flex-wrap: wrap; gap: 1rem;">
+          <div class="text-sm text-muted" id="batch-summary-text">
+            <strong>${batchSelectedStudents.size}</strong> candidate(s) selected for enrollment into <strong>${esc(curCourse ? curCourse.name : '')}</strong>
+          </div>
+          <button type="button" class="btn btn-primary" id="btn-batch-enroll-action" data-a="batch-enroll-submit" ${batchSelectedStudents.size === 0 ? 'disabled' : ''}>
+            🚀 Enroll Selected (${batchSelectedStudents.size}) Students Now
+          </button>
+        </div>
       </div>
 
       <div class="card">
@@ -1804,18 +1985,21 @@ async function renderAdmin() {
 
 // ---------- FACULTY VIEW ----------
 async function renderFaculty() {
-  const courses = await api('/courses');
+  const [courses, tests] = await Promise.all([
+    getCachedCourses(),
+    getCachedTests()
+  ]);
   if (!F.course && courses.length > 0) {
     const myCourse = (S.user && S.user.role === 'faculty') ? courses.find(c => c.faculty_id === S.user.id || (c.faculty_list && c.faculty_list.some(f => f && f.id === S.user.id))) : null;
     F.course = myCourse ? myCourse.id : courses[0].id;
   }
   
   if (F.course) {
-    F.qs = await api(`/questions?course_id=${F.course}`);
+    if (!CACHE.qs[F.course]) CACHE.qs[F.course] = await api(`/questions?course_id=${F.course}`);
+    F.qs = CACHE.qs[F.course];
   } else {
     F.qs = [];
   }
-  const tests = await api('/tests');
 
   if (F.selectedQs.size === 0 && F.qs.length > 0) {
     F.qs.forEach(q => F.selectedQs.add(q.id));
@@ -1900,6 +2084,18 @@ async function renderFaculty() {
             <div>
               <label class="form-label">End Time Window *</label>
               <input type="datetime-local" name="end_at" class="form-control" value="${endStr}" required>
+            </div>
+            <div>
+              <label class="form-label">⏱️ Question Pace / Timer Mode</label>
+              <select name="per_question_timer" class="form-control">
+                <option value="0">Overall Exam Timer (Flexible Pace)</option>
+                <option value="30">⏱️ 30 Seconds / Question (Blitz Quiz)</option>
+                <option value="45">⏱️ 45 Seconds / Question</option>
+                <option value="60">⏱️ 60 Seconds / Question (1 Min / Q)</option>
+                <option value="90">⏱️ 90 Seconds / Question (1.5 Min / Q)</option>
+                <option value="120">⏱️ 120 Seconds / Question (2 Min / Q)</option>
+                <option value="180">⏱️ 180 Seconds / Question (3 Min / Q)</option>
+              </select>
             </div>
           </div>
 
@@ -2126,7 +2322,7 @@ Explanation: Quicksort partitions the array recursively in O(n log n) average ti
               </label>
             ` : ''}
           </div>
-          <div style="display: flex; gap: 0.5rem; align-items: center;">
+          <div style="display: flex; gap: 0.5rem; align-items: center;" id="faculty-bank-actions">
             ${(F.selectedBankQs && F.selectedBankQs.size > 0) ? `
               <button class="btn btn-sm btn-danger" data-a="delete-selected-bank-qs">
                 🗑️ Delete Selected (${F.selectedBankQs.size})
@@ -2627,6 +2823,133 @@ async function renderStudent() {
   `);
 }
 
+// ---------- ANALYTICS & PROCTORING AUDIT LOADER ----------
+async function loadTestAnalyticsAndProctoring(testId) {
+  const container = document.getElementById('analytics-container');
+  if (!container) return;
+  container.innerHTML = '<div class="text-center text-muted" style="padding: 2rem;">Loading analytics and live proctoring security logs...</div>';
+
+  try {
+    const [data, students] = await Promise.all([
+      api(`/tests/${testId}/results`),
+      api(`/tests/${testId}/students`)
+    ]);
+    const s = data.stats || {};
+    container.innerHTML = `
+      <div class="stats-grid mb-4">
+        <div class="stat-card"><span class="stat-label">Total Appeared</span><span class="stat-value">${s.appeared || 0}</span></div>
+        <div class="stat-card"><span class="stat-label">Average Score</span><span class="stat-value">${s.avg ? (+s.avg).toFixed(1) : 0}</span></div>
+        <div class="stat-card"><span class="stat-label">Highest Score</span><span class="stat-value" style="color: var(--success);">${s.highest ?? 0}</span></div>
+        <div class="stat-card"><span class="stat-label">Pass Percentage</span><span class="stat-value">${s.pass_pct ? (+s.pass_pct).toFixed(0) + '%' : '0%'}</span></div>
+      </div>
+
+      <!-- LIVE PROCTORING & SECURITY AUDIT PANEL -->
+      <div class="card mb-4" style="border: 1px solid var(--border); box-shadow: var(--shadow-sm);">
+        <div class="card-header" style="justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem;">
+          <div>
+            <div class="card-title">🛡️ Live Proctoring & Security Audit Log</div>
+            <div class="card-subtitle">Real-time tab switch warnings, rule violations & faculty overrides</div>
+          </div>
+          <button type="button" class="btn btn-sm btn-outline" data-a="refresh-proctoring-list" data-id="${testId}">🔄 Refresh Status</button>
+        </div>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr>
+                <th>Student Candidate</th>
+                <th>Department / Roll</th>
+                <th>Exam Progress</th>
+                <th>Tab Switches / Warnings</th>
+                <th>Security State</th>
+                <th>Faculty Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${students.length ? students.map(st => {
+                const isBlocked = !!st.is_blocked;
+                const warnings = st.warnings_count || 0;
+                const hasAttempt = !!st.attempt_id;
+                const isDone = !!st.submitted_at;
+                return `
+                  <tr style="background: ${isBlocked ? 'rgba(239, 68, 68, 0.05)' : ''};">
+                    <td>
+                      <strong>${esc(st.name)}</strong>
+                      <div class="text-xs text-muted">${esc(st.email)}</div>
+                    </td>
+                    <td>
+                      <code>${esc(st.roll_number || 'N/A')}</code>
+                      <div class="text-xs text-muted">${esc(st.department || '—')}</div>
+                    </td>
+                    <td>
+                      ${isDone 
+                        ? '<span class="badge badge-success">✓ Submitted</span>' 
+                        : hasAttempt 
+                        ? '<span class="badge badge-info">⏱ In Progress</span>' 
+                        : '<span class="badge" style="background: var(--surface-subtle); color: var(--text-muted);">Not Started</span>'}
+                    </td>
+                    <td>
+                      ${warnings >= 3 
+                        ? `<span class="badge badge-danger">⚠️ ${warnings}/3 Tab Switches (BLOCKED)</span>` 
+                        : warnings > 0 
+                        ? `<span class="badge badge-warning">⚠️ ${warnings}/3 Tab Switches</span>` 
+                        : '<span class="badge badge-success">✓ 0 Clean</span>'}
+                    </td>
+                    <td>
+                      ${isBlocked 
+                        ? `<span class="badge badge-danger" title="${esc(st.blocked_reason || '')}">🚫 BLOCKED</span>` 
+                        : hasAttempt 
+                        ? '<span class="badge badge-success">Active & Verified</span>' 
+                        : '—'}
+                    </td>
+                    <td>
+                      ${isBlocked ? `
+                        <button class="btn btn-sm btn-success" data-a="unblock-student" data-id="${st.attempt_id}">
+                          🔓 Unblock Student
+                        </button>
+                      ` : (hasAttempt && !isDone) ? `
+                        <button class="btn btn-sm btn-outline-danger" data-a="block-student" data-id="${st.attempt_id}">
+                          🚫 Block Attempt
+                        </button>
+                      ` : '<span class="text-sm text-muted">—</span>'}
+                    </td>
+                  </tr>
+                `;
+              }).join('') : '<tr><td colspan="6" class="text-center text-muted" style="padding: 2rem;">No students enrolled for this exam.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Official Rankings & Scorecard Table -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">🏆 Examination Official Rankings</div>
+        </div>
+        <div class="table-responsive">
+          <table>
+            <thead>
+              <tr><th>Rank</th><th>Student Name</th><th>Email</th><th>Score</th><th>Result</th></tr>
+            </thead>
+            <tbody>
+              ${data.rows.length ? data.rows.map(r => `
+                <tr>
+                  <td><strong>#${r.rank}</strong></td>
+                  <td>${esc(r.name)}</td>
+                  <td>${esc(r.email)}</td>
+                  <td><strong>${r.score}</strong> / ${r.total}</td>
+                  <td><span class="badge ${r.passed ? 'badge-success' : 'badge-danger'}">${r.passed ? 'Pass' : 'Fail'}</span></td>
+                </tr>
+              `).join('') : '<tr><td colspan="5" class="text-center text-muted" style="padding: 2rem;">No student submissions yet.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  } catch (err) {
+    container.innerHTML = `<div class="text-center text-danger" style="padding: 2rem;">Could not load report: ${esc(err.message)}</div>`;
+  }
+}
+
 // ---------- EXAM TAKER ENGINE (DISTRACTION FREE & MODERN) ----------
 function renderExamTaker() {
   if (!E) return;
@@ -2678,6 +3001,21 @@ function renderExamTaker() {
           return `<button class="${c}" data-a="jump-q" data-idx="${idx}">${idx + 1}</button>`;
         }).join('')}
       </div>
+
+      ${E.perQuestionTimer > 0 ? `
+        <div class="question-timer-card">
+          <div style="display: flex; align-items: center; gap: 0.6rem;">
+            <span class="badge badge-primary" style="font-weight: 700;">⏱️ Per-Question Timer</span>
+            <span class="text-xs text-muted">Fixed ${E.perQuestionTimer}s pace</span>
+          </div>
+          <div class="q-timer-bar-wrap">
+            <div id="q-timer-progress" class="q-timer-bar-fill" style="width: ${((E.qRemaining ?? E.perQuestionTimer) / E.perQuestionTimer) * 100}%; background-color: ${(E.qRemaining ?? E.perQuestionTimer) > 15 ? '#10b981' : (E.qRemaining ?? E.perQuestionTimer) > 5 ? '#f59e0b' : '#ef4444'};"></div>
+          </div>
+          <div id="q-timer-display" class="q-timer-badge ${(E.qRemaining ?? E.perQuestionTimer) > 15 ? 'normal' : (E.qRemaining ?? E.perQuestionTimer) > 5 ? 'warning' : 'danger'}">
+            ⏱️ ${String(Math.floor((E.qRemaining ?? E.perQuestionTimer) / 60)).padStart(2, '0')}:${String((E.qRemaining ?? E.perQuestionTimer) % 60).padStart(2, '0')}
+          </div>
+        </div>
+      ` : ''}
 
       <div class="q-box">
         <div class="q-meta">
@@ -2750,18 +3088,202 @@ function renderQuestionInputs(q, curAns) {
 }
 
 function tickExamTimer() {
-  const el = document.getElementById('exam-timer');
-  if (!el || !E) return;
+  if (!E) return;
+  // 1. Overall test window deadline check
   const remaining = Math.max(0, Math.floor((E.dl - (Date.now() + E.off)) / 1000));
-  const m = String(Math.floor(remaining / 60)).padStart(2, '0');
-  const s = String(remaining % 60).padStart(2, '0');
-  el.textContent = `⏱ ${m}:${s}`;
-  if (remaining < 300) {
-    el.className = 'exam-timer timer-danger';
+  const el = document.getElementById('exam-timer');
+  if (el) {
+    const m = String(Math.floor(remaining / 60)).padStart(2, '0');
+    const s = String(remaining % 60).padStart(2, '0');
+    el.textContent = `⏱ Total: ${m}:${s}`;
+    if (remaining < 300) {
+      el.className = 'exam-timer timer-danger';
+    }
   }
   if (remaining <= 0) {
     submitExam(true);
+    return;
   }
+
+  // 2. Per-Question strict pacing timer
+  if (E.perQuestionTimer > 0 && !E.isBlocked) {
+    E.qRemaining = Math.max(0, (E.qRemaining ?? E.perQuestionTimer) - 1);
+    const qDisp = document.getElementById('q-timer-display');
+    const qProg = document.getElementById('q-timer-progress');
+    if (qDisp) {
+      const qm = String(Math.floor(E.qRemaining / 60)).padStart(2, '0');
+      const qs = String(E.qRemaining % 60).padStart(2, '0');
+      qDisp.textContent = `⏱️ ${qm}:${qs}`;
+      qDisp.className = `q-timer-badge ${E.qRemaining > 15 ? 'normal' : E.qRemaining > 5 ? 'warning' : 'danger'}`;
+    }
+    if (qProg) {
+      const pct = Math.max(0, (E.qRemaining / E.perQuestionTimer) * 100);
+      qProg.style.width = pct + '%';
+      qProg.style.backgroundColor = E.qRemaining > 15 ? '#10b981' : E.qRemaining > 5 ? '#f59e0b' : '#ef4444';
+    }
+
+    if (E.qRemaining <= 0) {
+      flushExamAnswers();
+      if (E.i < E.qs.length - 1) {
+        toast(`Time up for Question ${E.i + 1}! Moving to next question.`, 'warning');
+        E.i++;
+        E.qRemaining = E.perQuestionTimer;
+        renderExamTaker();
+      } else {
+        toast('Time up for the final question! Submitting examination...', 'warning');
+        submitExam(true);
+      }
+    }
+  }
+}
+
+// ---------- PROCTORING & TAB-SWITCH CONTROLS ----------
+function initProctoringListeners() {
+  cleanupProctoringListeners();
+  document.addEventListener('visibilitychange', onExamVisibilityChange);
+  window.addEventListener('blur', onExamWindowBlur);
+}
+
+function cleanupProctoringListeners() {
+  document.removeEventListener('visibilitychange', onExamVisibilityChange);
+  window.removeEventListener('blur', onExamWindowBlur);
+  const existing = document.getElementById('proctor-overlay');
+  if (existing) existing.remove();
+}
+
+function onExamVisibilityChange() {
+  if (document.hidden && E && !E.busy && !E.isBlocked) {
+    handleProctorViolation('tab_switch');
+  }
+}
+
+function onExamWindowBlur() {
+  if (E && !E.busy && !E.isBlocked) {
+    handleProctorViolation('window_blur');
+  }
+}
+
+async function handleProctorViolation(eventType) {
+  if (!E || E.busy || E.isBlocked) return;
+  const now = Date.now();
+  if (now - (E.lastWarningTime || 0) < 3000) return; // 3-second debounce
+  E.lastWarningTime = now;
+
+  try {
+    const res = await api(`/attempts/${E.att}/warning`, 'POST', { action: eventType });
+    E.warnings = res.warnings_count;
+    E.isBlocked = !!res.is_blocked;
+    E.blockedReason = res.blocked_reason;
+
+    if (E.isBlocked) {
+      clearInterval(timerInterval);
+      clearInterval(saverInterval);
+      renderExamBlockedModal();
+    } else {
+      renderProctorWarningModal(E.warnings);
+    }
+  } catch (err) {
+    console.error('Proctoring error:', err);
+  }
+}
+
+function renderProctorWarningModal(count) {
+  const existing = document.getElementById('proctor-overlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'proctor-overlay';
+  overlay.className = 'proctor-alert-overlay';
+  overlay.innerHTML = `
+    <div class="proctor-alert-card">
+      <div class="proctor-warning-badge">⚠️ PROCTORING ALERT</div>
+      <h3 style="font-size: 1.35rem; font-weight: 800; color: #b91c1c; margin-bottom: 0.75rem;">
+        Tab Switching / Focus Loss Detected!
+      </h3>
+      <p style="font-size: 0.98rem; color: var(--text-main); margin-bottom: 1.25rem;">
+        Navigating away from the examination window is strictly forbidden by institutional policy.
+      </p>
+      <div style="background: #fef2f2; border: 1px solid #fecaca; border-radius: var(--radius-md); padding: 1.1rem; margin-bottom: 1.5rem;">
+        <div style="font-size: 1.25rem; font-weight: 800; color: #dc2626;">
+          Warning ${count} of 3
+        </div>
+        <div class="text-sm text-muted" style="margin-top: 4px;">
+          ${Math.max(0, 3 - count)} warning(s) remaining before your examination is <strong>AUTOMATICALLY BLOCKED</strong>.
+        </div>
+      </div>
+      <button type="button" class="btn btn-primary" id="btn-dismiss-proctor-warning" style="width: 100%; padding: 0.85rem; font-size: 1rem; font-weight: 700;">
+        I Understand — Return to Test
+      </button>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  document.getElementById('btn-dismiss-proctor-warning')?.addEventListener('click', () => {
+    overlay.remove();
+  });
+}
+
+function renderExamBlockedModal() {
+  const existing = document.getElementById('proctor-overlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'proctor-overlay';
+  overlay.className = 'proctor-alert-overlay';
+  overlay.innerHTML = `
+    <div class="proctor-blocked-card">
+      <div style="font-size: 3.5rem; line-height: 1; margin-bottom: 1rem;">🚫</div>
+      <h2 style="font-size: 1.6rem; font-weight: 800; color: #ef4444; margin-bottom: 0.75rem;">
+        EXAMINATION BLOCKED
+      </h2>
+      <p style="font-size: 1.05rem; color: #cbd5e1; margin-bottom: 1.5rem;">
+        Your test has been locked by the proctoring system due to repeated tab-switching violations (3/3 warnings exceeded).
+      </p>
+      <div style="background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; border-radius: var(--radius-md); padding: 1.25rem; margin-bottom: 1.75rem; text-align: left;">
+        <div style="font-weight: 700; color: #fca5a5; margin-bottom: 0.25rem;">Violation Reason:</div>
+        <div style="color: #f8fafc; font-size: 0.95rem;">${esc(E?.blockedReason || 'Exceeded maximum allowed tab switches (3/3).')}</div>
+        <div class="text-xs" style="margin-top: 0.65rem; color: #94a3b8;">
+          All previous answers have been safely autosaved. Your exam cannot proceed until your faculty instructor reviews and unblocks your session.
+        </div>
+      </div>
+      <div style="display: flex; gap: 0.75rem; justify-content: center; flex-wrap: wrap;">
+        <button type="button" class="btn btn-primary" id="btn-check-unblock-status" style="padding: 0.75rem 1.5rem;">
+          🔄 Check if Faculty Unblocked You
+        </button>
+        <button type="button" class="btn btn-secondary" id="btn-exit-to-dash">
+          Back to Dashboard
+        </button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  document.getElementById('btn-check-unblock-status')?.addEventListener('click', async () => {
+    try {
+      if (!E || !E.testId) return;
+      const res = await api(`/tests/${E.testId}/start`, 'POST');
+      if (res && !res.is_blocked) {
+        overlay.remove();
+        E.isBlocked = false;
+        E.warnings = 0;
+        toast('🎉 Your examination has been unblocked by faculty! Resuming...', 'success');
+        timerInterval = setInterval(tickExamTimer, 1000);
+        saverInterval = setInterval(flushExamAnswers, 4000);
+        initProctoringListeners();
+        renderExamTaker();
+      } else {
+        toast('Still blocked. Please ask your faculty instructor to click "Unblock".', 'error');
+      }
+    } catch (err) {
+      toast(err.message || 'Attempt is still blocked.', 'error');
+    }
+  });
+
+  document.getElementById('btn-exit-to-dash')?.addEventListener('click', () => {
+    cleanupProctoringListeners();
+    E = null;
+    window.location.hash = '#/dashboard';
+    render();
+  });
 }
 
 async function flushExamAnswers() {
@@ -2790,6 +3312,7 @@ async function flushExamAnswers() {
 async function submitExam(auto = false) {
   if (!E || E.busy) return;
   E.busy = true;
+  cleanupProctoringListeners();
   await flushExamAnswers();
   try {
     await api(`/attempts/${E.att}/submit`, 'POST');
@@ -2865,6 +3388,7 @@ document.addEventListener('click', async e => {
     } else if (action === 'delete-user') {
       if (!confirm(`Are you sure you want to permanently delete user "${target.dataset.name}"?`)) return;
       await api(`/users/${target.dataset.id}`, 'DELETE');
+      invalidateCache('users');
       toast('User deleted successfully');
       render();
     } else if (action === 'edit-user-modal') {
@@ -2989,11 +3513,13 @@ document.addEventListener('click', async e => {
     } else if (action === 'delete-course') {
       if (!confirm(`Are you sure you want to permanently delete course "${target.dataset.name}" and its associated tests?`)) return;
       await api(`/courses/${target.dataset.id}`, 'DELETE');
+      invalidateCache('courses');
       toast('Course deleted successfully');
       render();
     } else if (action === 'delete-test') {
       if (!confirm(`Are you sure you want to delete examination "${target.dataset.title}"?`)) return;
       await api(`/tests/${target.dataset.id}`, 'DELETE');
+      invalidateCache('tests');
       toast('Examination deleted');
       render();
     } else if (action === 'edit-test-modal') {
@@ -3029,6 +3555,18 @@ document.addEventListener('click', async e => {
               <label class="form-label">End Time</label>
               <input type="datetime-local" name="end_at" class="form-control" value="${endIso}" required>
             </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">⏱️ Question Pace / Timer Mode</label>
+            <select name="per_question_timer" class="form-control">
+              <option value="0" ${!t.per_question_timer ? 'selected' : ''}>Overall Exam Timer (Flexible Pace)</option>
+              <option value="30" ${t.per_question_timer == 30 ? 'selected' : ''}>⏱️ 30 Seconds / Question (Blitz Quiz)</option>
+              <option value="45" ${t.per_question_timer == 45 ? 'selected' : ''}>⏱️ 45 Seconds / Question</option>
+              <option value="60" ${t.per_question_timer == 60 ? 'selected' : ''}>⏱️ 60 Seconds / Question (1 Min / Q)</option>
+              <option value="90" ${t.per_question_timer == 90 ? 'selected' : ''}>⏱️ 90 Seconds / Question (1.5 Min / Q)</option>
+              <option value="120" ${t.per_question_timer == 120 ? 'selected' : ''}>⏱️ 120 Seconds / Question (2 Min / Q)</option>
+              <option value="180" ${t.per_question_timer == 180 ? 'selected' : ''}>⏱️ 180 Seconds / Question (3 Min / Q)</option>
+            </select>
           </div>
           <div class="flex justify-between items-center mt-4">
             <button type="button" class="btn btn-secondary" data-a="close-modal">Cancel</button>
@@ -3172,6 +3710,25 @@ document.addEventListener('click', async e => {
     } else if (action === 'start-exam') {
       const testId = target.dataset.id;
       const res = await api(`/tests/${testId}/start`, 'POST');
+      if (res.is_blocked) {
+        E = {
+          att: res.attempt_id,
+          qs: res.questions,
+          i: 0,
+          ans: {},
+          mk: {},
+          pend: {},
+          off: Date.parse(res.server_time) - Date.now(),
+          dl: Date.parse(res.deadline),
+          perQuestionTimer: res.per_question_timer || 0,
+          qRemaining: res.per_question_timer || 0,
+          warnings: res.warnings_count || 0,
+          isBlocked: true,
+          blockedReason: res.blocked_reason || 'Session blocked by proctoring policy.'
+        };
+        renderExamBlockedModal(res.blocked_reason || 'Examination session is currently blocked by instructor.');
+        return;
+      }
       E = {
         att: res.attempt_id,
         qs: res.questions,
@@ -3180,20 +3737,32 @@ document.addEventListener('click', async e => {
         mk: {},
         pend: {},
         off: Date.parse(res.server_time) - Date.now(),
-        dl: Date.parse(res.deadline)
+        dl: Date.parse(res.deadline),
+        perQuestionTimer: res.per_question_timer || 0,
+        qRemaining: res.per_question_timer || 0,
+        warnings: res.warnings_count || 0,
+        isBlocked: false,
+        blockedReason: null
       };
       res.saved.forEach(s => {
         E.ans[s.question_id] = s.answer;
         E.mk[s.question_id] = s.marked;
       });
+      initProctoringListeners();
       timerInterval = setInterval(tickExamTimer, 1000);
       saverInterval = setInterval(flushExamAnswers, 4000);
       render();
     } else if (action === 'jump-q') {
       E.i = parseInt(target.dataset.idx);
+      if (E && E.perQuestionTimer > 0) {
+        E.qRemaining = E.perQuestionTimer;
+      }
       renderExamTaker();
     } else if (action === 'nav-q') {
       E.i += parseInt(target.dataset.dir);
+      if (E && E.perQuestionTimer > 0) {
+        E.qRemaining = E.perQuestionTimer;
+      }
       renderExamTaker();
     } else if (action === 'toggle-mark') {
       const qid = E.qs[E.i].id;
@@ -3251,37 +3820,27 @@ document.addEventListener('click', async e => {
         `;
       }
     } else if (action === 'load-analytics') {
-      const testId = document.getElementById('res-test-select').value;
+      const testId = document.getElementById('res-test-select')?.value;
       if (!testId) return toast('Please select an exam first', 'error');
-      const data = await api(`/tests/${testId}/results`);
-      const s = data.stats;
-      const container = document.getElementById('analytics-container');
-      container.innerHTML = `
-        <div class="stats-grid mb-4">
-          <div class="stat-card"><span class="stat-label">Appeared</span><span class="stat-value">${s.appeared || 0}</span></div>
-          <div class="stat-card"><span class="stat-label">Average Score</span><span class="stat-value">${s.avg ? (+s.avg).toFixed(1) : 0}</span></div>
-          <div class="stat-card"><span class="stat-label">Highest Score</span><span class="stat-value" style="color: var(--success);">${s.highest ?? 0}</span></div>
-          <div class="stat-card"><span class="stat-label">Pass Percentage</span><span class="stat-value">${s.pass_pct ? (+s.pass_pct).toFixed(0) + '%' : '0%'}</span></div>
-        </div>
-        <div class="table-responsive">
-          <table>
-            <thead>
-              <tr><th>Rank</th><th>Student Name</th><th>Email</th><th>Score</th><th>Result</th></tr>
-            </thead>
-            <tbody>
-              ${data.rows.map(r => `
-                <tr>
-                  <td><strong>#${r.rank}</strong></td>
-                  <td>${esc(r.name)}</td>
-                  <td>${esc(r.email)}</td>
-                  <td><strong>${r.score}</strong> / ${r.total}</td>
-                  <td><span class="badge ${r.passed ? 'badge-success' : 'badge-danger'}">${r.passed ? 'Pass' : 'Fail'}</span></td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
-        </div>
-      `;
+      await loadTestAnalyticsAndProctoring(testId);
+    } else if (action === 'refresh-proctoring-list') {
+      const testId = target.dataset.id;
+      if (testId) await loadTestAnalyticsAndProctoring(testId);
+    } else if (action === 'unblock-student') {
+      const attemptId = target.dataset.id;
+      if (!attemptId) return;
+      await api(`/attempts/${attemptId}/unblock`, 'POST');
+      toast('Student unblocked successfully. They can now resume their examination.', 'success');
+      const testId = document.getElementById('res-test-select')?.value;
+      if (testId) await loadTestAnalyticsAndProctoring(testId);
+    } else if (action === 'block-student') {
+      const attemptId = target.dataset.id;
+      if (!attemptId) return;
+      if (!confirm('Are you sure you want to block this student attempt?')) return;
+      await api(`/attempts/${attemptId}/block`, 'POST', { reason: 'Manually blocked by instructor / proctor.' });
+      toast('Student attempt blocked.');
+      const testId = document.getElementById('res-test-select')?.value;
+      if (testId) await loadTestAnalyticsAndProctoring(testId);
     } else if (action === 'download-csv') {
       const testId = document.getElementById('res-test-select').value;
       if (!testId) return toast('Please select an exam first', 'error');
@@ -3292,6 +3851,49 @@ document.addEventListener('click', async e => {
       a.download = `ExamFlow-Test-${testId}-Analytics.csv`;
       a.click();
       toast('CSV report generated');
+    } else if (action === 'batch-select-all-filtered') {
+      const visibleCheckboxes = document.querySelectorAll('.batch-student-cb');
+      visibleCheckboxes.forEach(cb => {
+        cb.checked = true;
+        batchSelectedStudents.add(+cb.dataset.id);
+        const tr = cb.closest('tr');
+        if (tr) tr.style.background = 'rgba(79, 70, 229, 0.04)';
+      });
+      updateBatchEnrollmentUI();
+    } else if (action === 'batch-clear-all-selected') {
+      batchSelectedStudents.clear();
+      document.querySelectorAll('.batch-student-cb').forEach(cb => {
+        cb.checked = false;
+        const tr = cb.closest('tr');
+        if (tr) tr.style.background = '';
+      });
+      const checkAll = document.getElementById('batch-check-all');
+      if (checkAll) checkAll.checked = false;
+      updateBatchEnrollmentUI();
+    } else if (action === 'batch-enroll-submit') {
+      if (!batchEnrollCourseId || batchSelectedStudents.size === 0) {
+        return toast('Please select at least one student to enroll', 'error');
+      }
+      const sIds = Array.from(batchSelectedStudents);
+      const btn = document.getElementById('btn-batch-enroll-action');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '⏳ Enrolling candidates...';
+      }
+      try {
+        await api(`/courses/${batchEnrollCourseId}/enroll`, 'POST', { student_ids: sIds });
+        toast(`🎉 Successfully enrolled ${sIds.length} student(s) into course!`, 'success');
+        batchSelectedStudents.clear();
+        invalidateCache('courses');
+        delete CACHE.candidates[batchEnrollCourseId];
+        render();
+      } catch (err) {
+        toast(err.message || 'Enrollment failed', 'error');
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = `🚀 Enroll Selected (${sIds.length}) Students Now`;
+        }
+      }
     } else if (action === 'browse-doc' || action === 'dropzone-click') {
       const fi = document.getElementById('extractor-file-input');
       if (fi) fi.click();
@@ -3430,10 +4032,12 @@ document.addEventListener('submit', async e => {
       render();
     } else if (fType === 'mkuser') {
       await api('/users', 'POST', formData);
+      invalidateCache('users');
       toast('User created successfully');
       render();
     } else if (fType === 'update-user') {
       await api(`/users/${form.dataset.id}`, 'PUT', formData);
+      invalidateCache('users');
       modalContent = null;
       toast('User profile updated successfully');
       render();
@@ -3446,6 +4050,7 @@ document.addEventListener('submit', async e => {
         faculty_id: fid,
         faculty_ids: checkedFaculties.length ? checkedFaculties : (fid ? [fid] : [])
       });
+      invalidateCache('courses');
       toast('Course created successfully');
       render();
     } else if (fType === 'update-course') {
@@ -3457,6 +4062,7 @@ document.addEventListener('submit', async e => {
         faculty_id: fid,
         faculty_ids: checkedFaculties.length ? checkedFaculties : (fid ? [fid] : [])
       });
+      invalidateCache('courses');
       modalContent = null;
       toast('Course details updated');
       render();
@@ -3466,8 +4072,10 @@ document.addEventListener('submit', async e => {
         duration_min: +formData.duration_min,
         pass_marks: +formData.pass_marks,
         start_at: new Date(formData.start_at).toISOString(),
-        end_at: new Date(formData.end_at).toISOString()
+        end_at: new Date(formData.end_at).toISOString(),
+        per_question_timer: +formData.per_question_timer || 0
       });
+      invalidateCache('tests');
       modalContent = null;
       toast('Exam updated successfully');
       render();
@@ -3482,12 +4090,15 @@ document.addEventListener('submit', async e => {
         correct: cor,
         marks: +formData.marks
       });
+      if (F.course) CACHE.qs[F.course] = null;
       modalContent = null;
       toast('Question updated');
       render();
     } else if (fType === 'enroll') {
       const sIds = formData.student_ids.split(',').map(s => parseInt(s.trim())).filter(Boolean);
       await api(`/courses/${formData.course_id}/enroll`, 'POST', { student_ids: sIds });
+      invalidateCache('courses');
+      delete CACHE.candidates[formData.course_id];
       toast(`Enrolled ${sIds.length} student(s)`);
       render();
     } else if (fType === 'parse') {
@@ -3509,8 +4120,10 @@ document.addEventListener('submit', async e => {
         pass_marks: +formData.pass_marks,
         start_at: new Date(formData.start_at).toISOString(),
         end_at: new Date(formData.end_at).toISOString(),
+        per_question_timer: +formData.per_question_timer || 0,
         question_ids: checkedQs
       });
+      invalidateCache('tests');
       toast('🎉 Examination created successfully! Link is ready to share.');
       render();
     }
@@ -3545,9 +4158,145 @@ function applyUserDirectoryFilters() {
   if (countEl) countEl.textContent = `User Directory (${visibleCount} shown)`;
 }
 
+// ---------- BATCH ENROLLMENT UI HELPERS (ZERO-LAG) ----------
+function updateBatchEnrollmentUI() {
+  const count = batchSelectedStudents.size;
+  const badge = document.getElementById('batch-selected-count-badge');
+  if (badge) badge.textContent = count;
+  
+  const summary = document.getElementById('batch-summary-text');
+  if (summary) {
+    const courseSelect = document.getElementById('batch-course-select');
+    const courseText = courseSelect ? courseSelect.options[courseSelect.selectedIndex]?.text : '';
+    summary.innerHTML = `<strong>${count}</strong> candidate(s) selected for enrollment ${courseText ? `into <strong>${esc(courseText.split('(')[0].trim())}</strong>` : ''}`;
+  }
+  
+  const btn = document.getElementById('btn-batch-enroll-action');
+  if (btn) {
+    btn.textContent = `🚀 Enroll Selected (${count}) Students Now`;
+    btn.disabled = count === 0;
+  }
+
+  // Check if all visible checkboxes are checked
+  const visibleCbs = document.querySelectorAll('.batch-student-cb');
+  const allCheck = document.getElementById('batch-check-all');
+  if (allCheck && visibleCbs.length) {
+    const allChecked = Array.from(visibleCbs).every(cb => cb.checked);
+    allCheck.checked = allChecked;
+  }
+}
+
+function filterBatchTableRows(query) {
+  const q = (query || '').toLowerCase().trim();
+  batchSearchQuery = query;
+  const rows = document.querySelectorAll('#batch-candidates-tbody tr');
+  let matched = 0;
+  rows.forEach(row => {
+    if (row.querySelector('td[colspan]')) return;
+    const text = row.textContent.toLowerCase();
+    const visible = !q || text.includes(q);
+    row.style.display = visible ? '' : 'none';
+    if (visible) matched++;
+  });
+}
+
+// ---------- QUESTION BANK SELECTION UI HELPER (ZERO-LAG) ----------
+function updateBankSelectionUI() {
+  if (!F.selectedBankQs) F.selectedBankQs = new Set();
+  const total = F.qs ? F.qs.length : 0;
+  const count = F.selectedBankQs.size;
+  
+  const allCb = document.getElementById('select-all-bank-qs');
+  if (allCb) {
+    allCb.checked = (total > 0 && count === total);
+    const span = allCb.parentElement?.querySelector('span');
+    if (span) span.textContent = `Select All (${count}/${total})`;
+  }
+
+  const actionsContainer = document.getElementById('faculty-bank-actions');
+  let delBtn = document.querySelector('[data-a="delete-selected-bank-qs"]');
+  if (count > 0) {
+    if (delBtn) {
+      delBtn.innerHTML = `🗑️ Delete Selected (${count})`;
+    } else if (actionsContainer) {
+      const btn = document.createElement('button');
+      btn.className = 'btn btn-sm btn-danger';
+      btn.dataset.a = 'delete-selected-bank-qs';
+      btn.innerHTML = `🗑️ Delete Selected (${count})`;
+      actionsContainer.prepend(btn);
+    }
+  } else if (delBtn) {
+    delBtn.remove();
+  }
+
+  document.querySelectorAll('.bank-q-checkbox').forEach(cb => {
+    const qid = +cb.dataset.qid;
+    const isChecked = F.selectedBankQs.has(qid);
+    cb.checked = isChecked;
+    const card = cb.closest('.opt-card');
+    if (card) {
+      card.style.borderLeft = isChecked ? '3px solid var(--danger, #ef4444)' : '1px solid var(--border)';
+    }
+  });
+}
+
 // ---------- INPUT CHANGE LISTENERS ----------
 document.addEventListener('change', e => {
-  // Select All Bank Questions Checkbox
+  // Batch Course Select Changed
+  if (e.target.id === 'batch-course-select') {
+    batchEnrollCourseId = +e.target.value;
+    batchSelectedStudents.clear();
+    render();
+    return;
+  }
+
+  // Batch Branch Select Changed
+  if (e.target.id === 'batch-branch-select') {
+    batchBranchFilter = e.target.value;
+    render();
+    return;
+  }
+
+  // Batch Status Select Changed
+  if (e.target.id === 'batch-status-select') {
+    batchStatusFilter = e.target.value;
+    render();
+    return;
+  }
+
+  // Batch Check All Checkbox
+  if (e.target.id === 'batch-check-all') {
+    const isChecked = e.target.checked;
+    document.querySelectorAll('.batch-student-cb').forEach(cb => {
+      cb.checked = isChecked;
+      const sid = +cb.dataset.id;
+      if (isChecked) {
+        batchSelectedStudents.add(sid);
+      } else {
+        batchSelectedStudents.delete(sid);
+      }
+      const tr = cb.closest('tr');
+      if (tr) tr.style.background = isChecked ? 'rgba(79, 70, 229, 0.04)' : '';
+    });
+    updateBatchEnrollmentUI();
+    return;
+  }
+
+  // Single Batch Student Checkbox
+  if (e.target.classList.contains('batch-student-cb')) {
+    const sid = +e.target.dataset.id;
+    if (e.target.checked) {
+      batchSelectedStudents.add(sid);
+    } else {
+      batchSelectedStudents.delete(sid);
+    }
+    const tr = e.target.closest('tr');
+    if (tr) tr.style.background = e.target.checked ? 'rgba(79, 70, 229, 0.04)' : '';
+    updateBatchEnrollmentUI();
+    return;
+  }
+
+  // Select All Bank Questions Checkbox (Zero Lag)
   if (e.target.id === 'select-all-bank-qs') {
     if (!F.selectedBankQs) F.selectedBankQs = new Set();
     if (e.target.checked) {
@@ -3555,11 +4304,11 @@ document.addEventListener('change', e => {
     } else {
       F.selectedBankQs.clear();
     }
-    render();
+    updateBankSelectionUI();
     return;
   }
 
-  // Single Bank Question Checkbox
+  // Single Bank Question Checkbox (Zero Lag)
   if (e.target.classList.contains('bank-q-checkbox')) {
     if (!F.selectedBankQs) F.selectedBankQs = new Set();
     const qid = +e.target.dataset.qid;
@@ -3568,7 +4317,7 @@ document.addEventListener('change', e => {
     } else {
       F.selectedBankQs.delete(qid);
     }
-    render();
+    updateBankSelectionUI();
     return;
   }
 
@@ -3639,6 +4388,10 @@ document.addEventListener('drop', e => {
 document.addEventListener('input', e => {
   if (e.target.id === 'user-search-input') {
     applyUserDirectoryFilters();
+    return;
+  }
+  if (e.target.id === 'batch-search-input') {
+    filterBatchTableRows(e.target.value);
     return;
   }
 

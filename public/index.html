@@ -1136,6 +1136,84 @@
     @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
     @keyframes slideUp { from { transform: translateY(16px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
     @keyframes slideInRight { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+    @keyframes pulseGlow { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.8; transform: scale(1.02); } }
+
+    /* Proctoring Warning & Block Overlays */
+    .proctor-alert-overlay {
+      position: fixed; inset: 0; z-index: 9999;
+      background: rgba(15, 23, 42, 0.85);
+      backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      display: flex; align-items: center; justify-content: center;
+      padding: 1.5rem; animation: fadeIn 0.2s ease;
+    }
+    .proctor-alert-card {
+      background: var(--surface); border-radius: var(--radius-lg);
+      max-width: 540px; width: 100%; padding: 2.25rem;
+      border: 2px solid var(--danger); box-shadow: 0 25px 50px -12px rgba(239, 68, 68, 0.25);
+      animation: slideUp 0.25s ease; text-align: center;
+    }
+    .proctor-blocked-card {
+      background: #0f172a; color: #f8fafc; border-radius: var(--radius-lg);
+      max-width: 580px; width: 100%; padding: 2.5rem;
+      border: 2px solid #ef4444; box-shadow: 0 25px 50px -12px rgba(239, 68, 68, 0.4);
+      animation: slideUp 0.25s ease; text-align: center;
+    }
+    .proctor-warning-badge {
+      display: inline-flex; align-items: center; gap: 0.4rem;
+      padding: 0.5rem 1.25rem; border-radius: 999px;
+      background: #fee2e2; color: #b91c1c; font-weight: 800; font-size: 1rem;
+      margin-bottom: 1.25rem;
+    }
+
+    /* Per-Question Live Countdown & Pace Bar */
+    .question-timer-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius-md); padding: 0.75rem 1.25rem;
+      margin-bottom: 1rem; display: flex; align-items: center; justify-content: space-between;
+      gap: 1rem; box-shadow: var(--shadow-xs);
+    }
+    .q-timer-badge {
+      display: inline-flex; align-items: center; gap: 0.45rem;
+      font-family: 'JetBrains Mono', monospace; font-size: 1.15rem; font-weight: 800;
+      padding: 0.35rem 0.85rem; border-radius: var(--radius-sm);
+      transition: all 0.2s ease;
+    }
+    .q-timer-badge.normal { background: #ecfdf5; color: #047857; }
+    .q-timer-badge.warning { background: #fffbeb; color: #b45309; }
+    .q-timer-badge.danger { background: #fef2f2; color: #b91c1c; animation: pulseGlow 1s infinite; }
+    .q-timer-bar-wrap {
+      flex: 1; height: 8px; background: var(--surface-subtle);
+      border-radius: 999px; overflow: hidden;
+    }
+    .q-timer-bar-fill {
+      height: 100%; border-radius: 999px;
+      transition: width 1s linear, background-color 0.3s ease;
+    }
+
+    /* Branch Pills for Batch Enrollment */
+    .branch-badge {
+      display: inline-flex; align-items: center; gap: 0.3rem;
+      padding: 0.2rem 0.55rem; border-radius: 6px;
+      font-size: 0.78rem; font-weight: 700;
+    }
+    .branch-cse { background: #e0e7ff; color: #3730a3; }
+    .branch-ece { background: #e0f2fe; color: #0369a1; }
+    .branch-it { background: #fef3c7; color: #92400e; }
+    .branch-mech { background: #fee2e2; color: #991b1b; }
+    .branch-civil { background: #f3e8ff; color: #6b21a8; }
+    .branch-gen { background: #f1f5f9; color: #334155; }
+
+    /* Performance & Smoothness Acceleration */
+    html { scroll-behavior: smooth; }
+    .card, .btn, .tab-btn, .opt-card {
+      transform: translateZ(0);
+      will-change: transform;
+      transition: transform 0.15s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.15s cubic-bezier(0.4, 0, 0.2, 1), background-color 0.15s ease;
+    }
+    .table-responsive {
+      contain: paint;
+      -webkit-overflow-scrolling: touch;
+    }
   </style>
 </head>
 <body>

@@ -97,6 +97,11 @@ async function migrate() {
       ON CONFLICT DO NOTHING;
 
       ALTER TABLE public.enrollments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
+      ALTER TABLE public.tests ADD COLUMN IF NOT EXISTS per_question_timer INT DEFAULT 0;
+      ALTER TABLE public.attempts ADD COLUMN IF NOT EXISTS warnings_count INT DEFAULT 0;
+      ALTER TABLE public.attempts ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN DEFAULT false;
+      ALTER TABLE public.attempts ADD COLUMN IF NOT EXISTS blocked_reason TEXT DEFAULT NULL;
+      ALTER TABLE public.attempts ADD COLUMN IF NOT EXISTS tab_switches INT DEFAULT 0;
     `);
 
     // Always ensure Admin user is properly configured and unlocked

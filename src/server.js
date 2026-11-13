@@ -570,6 +570,18 @@ app.get('/api/courses/:id/students',auth('admin','faculty'),h(async(req,res)=>{
     WHERE e.course_id=$1 ORDER BY u.name`,[req.params.id]));
 }));
 
+app.get('/api/courses/:id/enrollment-candidates',auth('admin','faculty'),h(async(req,res)=>{
+  if(!(await ownsCourse(req.user,req.params.id)))return res.status(403).json({error:'Forbidden: You do not have permission to view enrollment candidates for this course'});
+  const cid=req.params.id;
+  const students=await q(`SELECT u.id, u.name, u.email, u.roll_number, u.department, u.year_sem,
+    EXISTS(SELECT 1 FROM enrollments e WHERE e.course_id=$1 AND e.student_id=u.id) enrolled,
+    (SELECT e.created_at FROM enrollments e WHERE e.course_id=$1 AND e.student_id=u.id) enrolled_at
+    FROM users u
+    WHERE u.role='student' AND u.status='active'
+    ORDER BY u.department NULLS LAST, u.roll_number NULLS LAST, u.name`,[cid]);
+  res.json(students);
+}));
+
 app.post('/api/courses/:id/self-enroll',auth('student'),h(async(req,res)=>{
   await q('INSERT INTO enrollments(course_id,student_id) VALUES($1,$2) ON CONFLICT DO NOTHING',[req.params.id,req.user.id]);
   res.json({enrolled:true});
@@ -759,8 +771,8 @@ app.post('/api/tests',auth('admin','faculty'),h(async(req,res)=>{
   const ids=b.question_ids||[];const ok=await q('SELECT id FROM questions WHERE id=ANY($1) AND course_id=$2 AND NOT archived',[ids,b.course_id]);
   if(ok.length!==ids.length||!ids.length)return res.status(400).json({error:'Invalid question set'});
   if(new Date(b.end_at)<=new Date(b.start_at)||b.duration_min<1)return res.status(400).json({error:'Invalid schedule'});
-  const[t]=await q('INSERT INTO tests(course_id,created_by,title,start_at,end_at,duration_min,pass_marks,shuffle) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
-   [b.course_id,req.user.id,b.title,b.start_at,b.end_at,b.duration_min,b.pass_marks||0,b.shuffle!==false]);
+  const[t]=await q('INSERT INTO tests(course_id,created_by,title,start_at,end_at,duration_min,pass_marks,shuffle,per_question_timer) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
+   [b.course_id,req.user.id,b.title,b.start_at,b.end_at,b.duration_min,b.pass_marks||0,b.shuffle!==false,+b.per_question_timer||0]);
   for(let i=0;i<ids.length;i++)await q('INSERT INTO test_questions VALUES($1,$2,$3)',[t.id,ids[i],i]);
   await audit(req.user.id,'test.create',{id:t.id});res.status(201).json(t)}));
 
@@ -769,8 +781,8 @@ app.put('/api/tests/:id',auth('admin','faculty'),h(async(req,res)=>{
   const existing=await ownsTest(req.user,tid);
   if(!existing)return res.status(403).json({error:'Forbidden: You do not have permission to modify this test'});
   const b=req.body;
-  const[t]=await q('UPDATE tests SET title=$1, start_at=$2, end_at=$3, duration_min=$4, pass_marks=$5 WHERE id=$6 RETURNING *',
-    [b.title,b.start_at,b.end_at,b.duration_min,b.pass_marks||0,tid]);
+  const[t]=await q('UPDATE tests SET title=$1, start_at=$2, end_at=$3, duration_min=$4, pass_marks=$5, per_question_timer=COALESCE($6, per_question_timer) WHERE id=$7 RETURNING *',
+    [b.title,b.start_at,b.end_at,b.duration_min,b.pass_marks||0,b.per_question_timer!==undefined?+b.per_question_timer:null,tid]);
   if(!t)return res.status(404).json({error:'Test not found'});
   if(Array.isArray(b.question_ids)&&b.question_ids.length){
     await q('DELETE FROM test_questions WHERE test_id=$1',[tid]);
@@ -817,7 +829,9 @@ app.post('/api/tests/:id/share',auth('admin','faculty'),h(async(req,res)=>{
 app.get('/api/tests/:id/students',auth('admin','faculty'),h(async(req,res)=>{
   const t=await ownsTest(req.user,req.params.id);
   if(!t)return res.status(403).json({error:'Forbidden: You do not have permission to view students for this test'});
-  res.json(await q(`SELECT u.id,u.name,u.email,a.submitted_at,a.started_at,r.score,r.total,r.passed FROM tests t
+  res.json(await q(`SELECT u.id,u.name,u.email,u.roll_number,u.department,
+   a.id attempt_id,a.submitted_at,a.started_at,a.warnings_count,a.tab_switches,a.is_blocked,a.blocked_reason,
+   r.score,r.total,r.passed FROM tests t
    JOIN enrollments e ON e.course_id=t.course_id JOIN users u ON u.id=e.student_id
    LEFT JOIN attempts a ON a.test_id=t.id AND a.student_id=u.id
    LEFT JOIN results r ON r.attempt_id=a.id
@@ -879,6 +893,55 @@ setInterval(()=>{
   q('SELECT id FROM attempts WHERE submitted_at IS NULL AND deadline<now()').then(r=>Promise.all(r.map(x=>finalize(x.id)))).catch(console.error);
 },15000);
 
+// ---- PROCTORING & ANTI-CHEATING CONTROLS ----
+app.post('/api/attempts/:id/warning',auth('student'),h(async(req,res)=>{
+  const[a]=await q('SELECT * FROM attempts WHERE id=$1 AND student_id=$2',[req.params.id,req.user.id]);
+  if(!a)return res.status(404).json({error:'Attempt not found'});
+  if(a.submitted_at)return res.status(409).json({error:'Attempt already submitted'});
+
+  const curWarnings = a.warnings_count || 0;
+  const nextWarnings = curWarnings + 1;
+  const shouldBlock = nextWarnings >= 3;
+  const reason = shouldBlock ? 'Exceeded maximum tab switch warnings (3/3). Test blocked by proctoring system.' : a.blocked_reason;
+
+  const[updated]=await q(`UPDATE attempts SET 
+    warnings_count=$1,
+    tab_switches=COALESCE(tab_switches,0)+1,
+    is_blocked=CASE WHEN $2 THEN true ELSE is_blocked END,
+    blocked_reason=CASE WHEN $2 THEN $3 ELSE blocked_reason END
+    WHERE id=$4 RETURNING id, warnings_count, tab_switches, is_blocked, blocked_reason`,
+    [nextWarnings, shouldBlock, reason, a.id]);
+
+  await audit(req.user.id, shouldBlock ? 'exam.proctor.blocked' : 'exam.proctor.warning', {
+    attempt_id: a.id,
+    warnings_count: nextWarnings,
+    action: req.body.action || 'tab_switch'
+  });
+
+  res.json(updated);
+}));
+
+app.post('/api/attempts/:id/unblock',auth('admin','faculty'),h(async(req,res)=>{
+  const[a]=await q('SELECT a.*, t.id test_id, t.course_id FROM attempts a JOIN tests t ON t.id=a.test_id WHERE a.id=$1',[req.params.id]);
+  if(!a)return res.status(404).json({error:'Attempt not found'});
+  if(!(await ownsTest(req.user, a.test_id)))return res.status(403).json({error:'Forbidden: You do not have permission to manage this exam attempt'});
+
+  const[updated]=await q('UPDATE attempts SET is_blocked=false, blocked_reason=NULL, warnings_count=0 WHERE id=$1 RETURNING *',[a.id]);
+  await audit(req.user.id,'exam.proctor.unblock',{attempt_id:a.id, student_id:a.student_id});
+  res.json({unblocked:true, attempt:updated});
+}));
+
+app.post('/api/attempts/:id/block',auth('admin','faculty'),h(async(req,res)=>{
+  const[a]=await q('SELECT a.*, t.id test_id, t.course_id FROM attempts a JOIN tests t ON t.id=a.test_id WHERE a.id=$1',[req.params.id]);
+  if(!a)return res.status(404).json({error:'Attempt not found'});
+  if(!(await ownsTest(req.user, a.test_id)))return res.status(403).json({error:'Forbidden: You do not have permission to manage this exam attempt'});
+
+  const reason = req.body.reason || 'Manually blocked by instructor / proctor.';
+  const[updated]=await q('UPDATE attempts SET is_blocked=true, blocked_reason=$2 WHERE id=$1 RETURNING *',[a.id, reason]);
+  await audit(req.user.id,'exam.proctor.manual_block',{attempt_id:a.id, student_id:a.student_id, reason});
+  res.json({blocked:true, attempt:updated});
+}));
+
 app.post('/api/tests/:id/start',auth('student'),h(async(req,res)=>{
   const[t]=await q('SELECT t.* FROM tests t JOIN enrollments e ON e.course_id=t.course_id AND e.student_id=$2 WHERE t.id=$1 AND t.published',[req.params.id,req.user.id]);
   if(!t)return res.status(404).json({error:'Test not available or you are not enrolled'});
@@ -886,14 +949,34 @@ app.post('/api/tests/:id/start',auth('student'),h(async(req,res)=>{
   const deadline=new Date(Math.min(+now+t.duration_min*60000,+t.end_at));
   const[a]=await q('INSERT INTO attempts(test_id,student_id,deadline) VALUES($1,$2,$3) ON CONFLICT(test_id,student_id) DO UPDATE SET test_id=EXCLUDED.test_id RETURNING *',[t.id,req.user.id,deadline]);
   if(a.submitted_at||a.deadline<=now){await finalize(a.id);return res.status(409).json({error:'Attempt already finished',attempt_id:a.id})}
+  if(a.is_blocked){
+    return res.status(403).json({
+      error: 'Exam attempt is BLOCKED: ' + (a.blocked_reason || 'Proctoring violation. Please contact your instructor.'),
+      is_blocked: true,
+      blocked_reason: a.blocked_reason,
+      attempt_id: a.id,
+      warnings_count: a.warnings_count
+    });
+  }
   let qs=await q('SELECT qn.id,qn.type,qn.text,qn.options,qn.marks FROM test_questions tq JOIN questions qn ON qn.id=tq.question_id WHERE tq.test_id=$1 ORDER BY tq.position',[t.id]);
   if(t.shuffle)qs=shuffle(qs,a.id);
   const saved=await q('SELECT question_id,answer,marked FROM responses WHERE attempt_id=$1',[a.id]);
-  res.json({attempt_id:a.id,deadline:a.deadline,server_time:now,questions:qs,saved})}));
+  res.json({
+    attempt_id:a.id,
+    deadline:a.deadline,
+    server_time:now,
+    per_question_timer:t.per_question_timer||0,
+    warnings_count:a.warnings_count||0,
+    is_blocked:!!a.is_blocked,
+    blocked_reason:a.blocked_reason||null,
+    questions:qs,
+    saved
+  })}));
 
 app.put('/api/attempts/:id/answers',auth('student'),h(async(req,res)=>{
   const[a]=await q('SELECT * FROM attempts WHERE id=$1 AND student_id=$2',[req.params.id,req.user.id]);
   if(!a)return res.status(404).json({error:'Not found'});
+  if(a.is_blocked)return res.status(403).json({error:'Exam attempt is blocked by proctoring system',is_blocked:true});
   if(a.submitted_at||a.deadline<=new Date())return res.status(409).json({error:'Attempt closed'});
   const list=Array.isArray(req.body)?req.body:[req.body];
   for(const r of list)await q(`INSERT INTO responses(attempt_id,question_id,answer,marked) SELECT $1,$2,$3,$4 WHERE EXISTS(SELECT 1 FROM test_questions WHERE test_id=$5 AND question_id=$2)
