@@ -82,149 +82,271 @@ const isAdmin=u=>u.role==='admin';
 const isFaculty=u=>u.role==='faculty'||u.role==='admin';
 const ownsCourse=async(u,cid)=>{
   if(isAdmin(u))return true;
-  const[c]=await q('SELECT * FROM courses WHERE id=$1',[cid]);
-  return Boolean(c&&c.faculty_id===u.id);
+  const[c]=await q(`SELECT 1 FROM courses c WHERE c.id=$1 AND (c.faculty_id=$2 OR EXISTS (SELECT 1 FROM course_faculty cf WHERE cf.course_id=c.id AND cf.faculty_id=$2))`,[cid,u.id]);
+  return Boolean(c);
 };
 const ownsTest=async(u,tid)=>{
   if(isAdmin(u)){const[t]=await q('SELECT * FROM tests WHERE id=$1',[tid]);return t||null}
   const[t]=await q(`SELECT t.*, c.faculty_id AS course_faculty_id 
-    FROM tests t JOIN courses c ON c.id=t.course_id WHERE t.id=$1`,[tid]);
-  if(t&&(t.created_by===u.id||t.course_faculty_id===u.id))return t;
+    FROM tests t JOIN courses c ON c.id=t.course_id 
+    WHERE t.id=$1 AND (t.created_by=$2 OR c.faculty_id=$2 OR EXISTS (SELECT 1 FROM course_faculty cf WHERE cf.course_id=c.id AND cf.faculty_id=$2))`,[tid,u.id]);
+  if(t)return t;
   return null;
 };
 const ownsQuestion=async(u,qid)=>{
   if(isAdmin(u))return true;
   const[qn]=await q(`SELECT q.*, c.faculty_id AS course_faculty_id 
-    FROM questions q JOIN courses c ON c.id=q.course_id WHERE q.id=$1`,[qid]);
-  return Boolean(qn&&(qn.created_by===u.id||qn.course_faculty_id===u.id));
+    FROM questions q JOIN courses c ON c.id=q.course_id 
+    WHERE q.id=$1 AND (q.created_by=$2 OR c.faculty_id=$2 OR EXISTS (SELECT 1 FROM course_faculty cf WHERE cf.course_id=c.id AND cf.faculty_id=$2))`,[qid,u.id]);
+  return Boolean(qn);
 };
 
-// ---- HIGH-ACCURACY QUESTION EXTRACTOR ----
-function parseQuestionsFromText(rawText){
-  if(!rawText)return[];
-  let text=String(rawText).replace(/\r\n/g,'\n').replace(/\r/g,'\n').replace(/\t/g,' ');
-
-  // Split into question blocks: match "1. ", "Q1. ", "Q.1", "Q1)", "(1) ", "Question 1:"
-  const splitter=/(?:^|\n)\s*(?:Q(?:uestion)?\s*[\d.]+\s*[:.)-]?|\(?\d+\s*[:.)-])\s+/i;
-  let rawBlocks=text.split(splitter);
-  if(rawBlocks.length<=1){
-    rawBlocks=text.split(/\n\s*\n+/);
+// ---- HIGH-ACCURACY QUESTION EXTRACTOR (MATHS & PROGRAMMING AWARE) ----
+function extractInlineOptions(line) {
+  const markerRegex = /(?:^|\s+)(?:\(([A-Ha-h1-9])\)|([A-Ha-h1-9])(?:\.|\)|:|\]|-))\s+/g;
+  const matches = [];
+  let m;
+  while ((m = markerRegex.exec(line)) !== null) {
+    const key = (m[1] || m[2]).toUpperCase();
+    matches.push({
+      key,
+      startIndex: m.index,
+      contentStart: m.index + m[0].length
+    });
   }
 
-  const out=[];
-  for(let block of rawBlocks){
-    block=block.trim();
-    if(!block||block.length<5)continue;
+  if (matches.length < 2) return null;
 
-    const lines=block.split('\n').map(l=>l.trim()).filter(Boolean);
-    if(!lines.length)continue;
+  const firstKey = matches[0].key;
+  const isLetter = /^[A-D]$/.test(firstKey);
+  const isDigit = /^[1-4]$/.test(firstKey);
+  if (!isLetter && !isDigit) return null;
 
-    let questionLines=[];
-    let options=[];
-    let answerText=null;
-    let marks=1;
-    let explanation='';
+  for (let i = 0; i < matches.length; i++) {
+    const expected = isLetter ? String.fromCharCode(65 + i) : String(1 + i);
+    if (matches[i].key !== expected) return null;
+  }
 
-    for(let i=0;i<lines.length;i++){
-      let l=lines[i];
+  const options = [];
+  for (let i = 0; i < matches.length; i++) {
+    const start = matches[i].contentStart;
+    const end = (i + 1 < matches.length) ? matches[i + 1].startIndex : line.length;
+    options.push(line.substring(start, end).trim());
+  }
 
-      // Match Marks: "(2 Marks)", "[1 Mark]", "Marks: 2", "(2m)", etc.
-      let mMarks=l.match(/(?:\[|\()?\s*marks?\s*[:\-]?\s*([\d.]+)\s*(?:marks?|pts?|m)?(?:\s*\]|\))?/i)
+  return options;
+}
+
+function parseQuestionsFromText(rawText) {
+  if (!rawText) return [];
+  const text = String(rawText).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const rawLines = text.split('\n');
+
+  const qStartRegex = /^\s*(?:Q(?:uestion)?\s*(\d+)[:.)-]?|(\d+)\s*[:.)-])\s+(.*)/i;
+  const optStartRegex = /^\s*(?:\(([A-Ha-h1-9])\)|([A-Ha-h1-9])(?:\.|\)|:|\]|-))\s+(.*)/;
+
+  const questionsRaw = [];
+  let currentQ = null;
+  let expectedQNum = 1;
+
+  for (let rawLine of rawLines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+
+    const qMatch = trimmed.match(qStartRegex);
+    const isInline = extractInlineOptions(trimmed);
+    let isNewQ = false;
+    let qNum = null;
+
+    if (qMatch && !isInline) {
+      qNum = parseInt(qMatch[1] || qMatch[2], 10);
+      const isEnclosedParen = /^\s*\(\d+\)/.test(trimmed);
+      const hasOptions = currentQ && currentQ.hasOptions;
+
+      if (!isEnclosedParen) {
+        if (!currentQ && qNum <= 2) {
+          isNewQ = true;
+        } else if (currentQ && (hasOptions || currentQ.hasAnswer)) {
+          isNewQ = true;
+        } else if (currentQ && qNum === expectedQNum) {
+          isNewQ = true;
+        }
+      }
+    }
+
+    if (isNewQ) {
+      if (currentQ) questionsRaw.push(currentQ);
+      currentQ = { num: qNum, lines: [trimmed], hasOptions: false, hasAnswer: false };
+      expectedQNum = qNum + 1;
+    } else {
+      if (!currentQ) {
+        currentQ = { num: 1, lines: [trimmed], hasOptions: false, hasAnswer: false };
+      } else {
+        currentQ.lines.push(trimmed);
+      }
+
+      if (isInline || optStartRegex.test(trimmed)) {
+        currentQ.hasOptions = true;
+      }
+      if (/^(?:correct\s*answer|correct\s*option|correct|answer|ans|key|sol|solution)\s*[:.\-]/i.test(trimmed)) {
+        currentQ.hasAnswer = true;
+      }
+    }
+  }
+
+  if (currentQ) questionsRaw.push(currentQ);
+
+  let blocksToProcess = questionsRaw.map(q => q.lines);
+  if (blocksToProcess.length <= 1 && text.includes('\n\n')) {
+    blocksToProcess = text.split(/\n\s*\n+/).map(b => b.split('\n').map(l => l.trim()).filter(Boolean));
+  }
+
+  const out = [];
+  for (let lines of blocksToProcess) {
+    if (!lines || !lines.length) continue;
+
+    let questionLines = [];
+    let options = [];
+    let answerText = null;
+    let marks = 1;
+    let explanation = '';
+
+    for (let i = 0; i < lines.length; i++) {
+      let l = lines[i];
+
+      // 1. First line of block is always the question text
+      if (i === 0) {
+        const cleaned = l.replace(/^\s*(?:Q(?:uestion)?\s*[\d.]+\s*[:.)-]?|\(?\d+\s*[:.)-])\s*/i, '');
+        questionLines.push(cleaned || l);
+        continue;
+      }
+
+      // Marks
+      let mMarks = l.match(/(?:\[|\()?\s*marks?\s*[:\-]?\s*([\d.]+)\s*(?:marks?|pts?|m)?(?:\s*\]|\))?/i)
         || l.match(/(?:\[|\()\s*([\d.]+)\s*(?:marks?|pts?|m)\s*(?:\]|\))/i);
-      if(mMarks){
-        marks=+mMarks[1]||1;
-        l=l.replace(mMarks[0],'').trim();
-        if(!l)continue;
+      if (mMarks) {
+        marks = +mMarks[1] || 1;
+        l = l.replace(mMarks[0], '').trim();
+        if (!l) continue;
       }
 
-      // Match Answer: "Answer: B", "Ans: (A)", "Correct: True", "Key: B, C", "Solution: A"
-      let mAns=l.match(/^(?:correct\s*answer|correct\s*option|correct|answer|ans|key|sol|solution)\s*[:.\-]\s*(.+)/i);
-      if(mAns){
-        answerText=mAns[1].trim();
+      // Answer
+      let mAns = l.match(/^(?:correct\s*answer|correct\s*option|correct|answer|ans|key|sol|solution)\s*[:.\-]\s*(.+)/i);
+      if (mAns) {
+        answerText = mAns[1].trim();
         continue;
       }
 
-      // Match Explanation
-      let mExp=l.match(/^(?:explanation|exp)\s*[:.\-]\s*(.+)/i);
-      if(mExp){
-        explanation=mExp[1].trim();
+      // Explanation
+      let mExp = l.match(/^(?:explanation|exp)\s*[:.\-]\s*(.+)/i);
+      if (mExp) {
+        explanation = mExp[1].trim();
         continue;
       }
 
-      // Check inline multiple options: e.g. "A) Yes  B) No  C) Maybe  D) Never"
-      const inlineOptMatches=[...l.matchAll(/(?:^|\s+)(?:\(?([A-Ha-h])[.)\]:\-])\s+([^A-Ha-h()\[\]]+)/g)];
-      if(inlineOptMatches.length>=2&&inlineOptMatches[0][1].toUpperCase()==='A'){
-        for(const om of inlineOptMatches){
-          options.push(om[2].trim());
-        }
+      // Inline multiple options: e.g. "A. input() B. print() C. show() D. display()" or "1. 3 2. 5 3. 7 4. 10"
+      const inlineOpts = extractInlineOptions(l);
+      if (inlineOpts && inlineOpts.length >= 2) {
+        options.push(...inlineOpts);
         continue;
       }
 
-      // Single option line: "A) Text", "a. Text", "(A) Text", "A - Text", "A: Text"
-      let mOpt=l.match(/^(?:\(?([A-Ha-h])[.)\]:\-])\s*(.+)/);
-      if(mOpt){
-        options.push(mOpt[2].trim());
+      // Single letter option: "A. Text", "A) Text", "(A) Text"
+      let mOptLetter = l.match(/^(?:\(([A-Ha-h])\)|([A-Ha-h])(?:\.|\)|:|\]|-))\s+(.+)/);
+      if (mOptLetter) {
+        options.push(mOptLetter[3].trim());
         continue;
       }
 
-      // Standalone True / False option lines
-      if(/^(?:true|false)$/i.test(l)&&options.length<2){
-        options.push(l.charAt(0).toUpperCase()+l.slice(1).toLowerCase());
+      // Single number option: "(1) Text", "1. Text", "1) Text"
+      let mOptNum = l.match(/^(?:\(([1-9])\)|([1-9])(?:\.|\)|:|\]|-))\s+(.+)/);
+      if (mOptNum && questionLines.length > 0) {
+        options.push(mOptNum[3].trim());
         continue;
       }
 
-      // Question body line (accumulated before options/answers start)
-      if(options.length===0&&!answerText){
-        const cleaned=l.replace(/^(?:Q(?:uestion)?\s*[\d.]+\s*[:.)-]?|\(?\d+\s*[:.)-])\s*/i,'');
-        questionLines.push(cleaned);
+      // Standalone True / False
+      if (/^(?:true|false)$/i.test(l) && options.length < 2) {
+        options.push(l.charAt(0).toUpperCase() + l.slice(1).toLowerCase());
+        continue;
+      }
+
+      // Question continuation line (before options/answers)
+      if (options.length === 0 && !answerText) {
+        questionLines.push(l);
       }
     }
 
-    const qText=questionLines.join(' ').trim();
-    // Skip header/footer noise blocks that have no question body or no options/answers
-    if(!qText||(options.length===0&&!answerText))continue;
+    const qText = questionLines.join(' ').trim();
+    if (!qText || (options.length === 0 && !answerText)) continue;
 
-    let correctIdx=[];
-    let qType='single';
+    let correctIdx = [];
+    let qType = 'single';
 
-    if(answerText){
-      // Check True/False answer
-      if(/^(?:true|t)$/i.test(answerText)){
-        qType='true_false';
-        correctIdx=['true'];
-      }else if(/^(?:false|f)$/i.test(answerText)){
-        qType='true_false';
-        correctIdx=['false'];
-      }else{
-        // Extract letters (e.g. "B", "(B)", "A, C", "Option B")
-        const letters=[...answerText.matchAll(/\b([A-Ha-h])\b/g)].map(m=>m[1].toUpperCase());
-        if(letters.length){
-          correctIdx=letters.map(x=>x.charCodeAt(0)-65);
-          if(correctIdx.length>1)qType='multiple';
-        }else if(options.length){
-          // Try matching option full text
-          const cleanAns=answerText.toLowerCase().trim();
-          const matchIdx=options.findIndex(opt=>opt.toLowerCase().trim()===cleanAns);
-          if(matchIdx!==-1)correctIdx=[matchIdx];
+    if (answerText) {
+      if (/^(?:true|t)$/i.test(answerText)) {
+        qType = 'true_false';
+        correctIdx = ['true'];
+      } else if (/^(?:false|f)$/i.test(answerText)) {
+        qType = 'true_false';
+        correctIdx = ['false'];
+      } else {
+        // Leading option letter or digit: e.g. "B. print()" -> "B", "(B)" -> "B", "(1)" -> 0, "2. print()" -> 1
+        const leadingKeyMatch = answerText.match(/^(?:\(?([A-Ha-h1-9])\)?(?:\.|\)|:|-|\s+|$))/);
+        if (leadingKeyMatch) {
+          const k = leadingKeyMatch[1].toUpperCase();
+          if (/^[A-H]$/.test(k)) {
+            const idx = k.charCodeAt(0) - 65;
+            if (options.length === 0 || idx < options.length) {
+              correctIdx = [idx];
+            }
+          } else if (/^[1-9]$/.test(k)) {
+            const idx = +k - 1;
+            if (options.length === 0 || idx < options.length) {
+              correctIdx = [idx];
+            }
+          }
+        }
+
+        // Check comma-separated multiple answers
+        if (!correctIdx.length) {
+          const multiLetters = [...answerText.matchAll(/\b([A-Ha-h])\b/g)].map(m => m[1].toUpperCase());
+          if (multiLetters.length >= 2) {
+            correctIdx = multiLetters.map(x => x.charCodeAt(0) - 65);
+            qType = 'multiple';
+          }
+        }
+
+        // Direct option text match
+        if (!correctIdx.length && options.length) {
+          const cleanAns = answerText.toLowerCase().replace(/^(?:option\s*)?[a-h1-9][.:)\s-]*/i, '').trim();
+          const rawAns = answerText.toLowerCase().trim();
+          let matchIdx = options.findIndex(opt => opt.toLowerCase().trim() === rawAns);
+          if (matchIdx === -1 && cleanAns) {
+            matchIdx = options.findIndex(opt => opt.toLowerCase().trim() === cleanAns);
+          }
+          if (matchIdx !== -1) {
+            correctIdx = [matchIdx];
+          }
         }
       }
     }
 
-    if(options.length===2&&/true/i.test(options[0])&&/false/i.test(options[1])){
-      qType='true_false';
-      if(correctIdx.length===1&&typeof correctIdx[0]==='number'){
-        correctIdx=[correctIdx[0]===0?'true':'false'];
+    if (options.length === 2 && /true/i.test(options[0]) && /false/i.test(options[1])) {
+      qType = 'true_false';
+      if (correctIdx.length === 1 && typeof correctIdx[0] === 'number') {
+        correctIdx = [correctIdx[0] === 0 ? 'true' : 'false'];
       }
     }
 
     out.push({
-      type:qType,
-      text:qText,
-      options:qType==='true_false'&&(!options||options.length<2)?['True','False']:options,
-      correct:correctIdx,
-      marks:marks||1,
-      explanation:explanation||'',
-      needs_review:!options.length||!correctIdx.length
+      type: qType,
+      text: qText,
+      options: qType === 'true_false' && (!options || options.length < 2) ? ['True', 'False'] : options,
+      correct: correctIdx,
+      marks: marks || 1,
+      explanation: explanation || '',
+      needs_review: !options.length || !correctIdx.length
     });
   }
   return out;
@@ -417,11 +539,15 @@ app.get('/api/courses',auth(),h(async(req,res)=>{
   const u=req.user;
   if(u.role==='student'){
     return res.json(await q(`SELECT c.*, f.name faculty_name, f.email faculty_email,
+      (SELECT string_agg(u2.name, ', ') FROM course_faculty cf2 JOIN users u2 ON u2.id=cf2.faculty_id WHERE cf2.course_id=c.id) faculty_names,
+      (SELECT json_agg(json_build_object('id', u2.id, 'name', u2.name, 'email', u2.email)) FROM course_faculty cf2 JOIN users u2 ON u2.id=cf2.faculty_id WHERE cf2.course_id=c.id) faculty_list,
       (SELECT COUNT(*) FROM tests t WHERE t.course_id=c.id AND t.published=true) tests_count
       FROM courses c JOIN enrollments e ON e.course_id=c.id
       LEFT JOIN users f ON f.id=c.faculty_id WHERE e.student_id=$1 ORDER BY c.id`,[u.id]));
   }
   res.json(await q(`SELECT c.*, f.name faculty_name, f.email faculty_email,
+    (SELECT string_agg(u2.name, ', ') FROM course_faculty cf2 JOIN users u2 ON u2.id=cf2.faculty_id WHERE cf2.course_id=c.id) faculty_names,
+    (SELECT json_agg(json_build_object('id', u2.id, 'name', u2.name, 'email', u2.email)) FROM course_faculty cf2 JOIN users u2 ON u2.id=cf2.faculty_id WHERE cf2.course_id=c.id) faculty_list,
     (SELECT COUNT(*) FROM enrollments e WHERE e.course_id=c.id) students_count,
     (SELECT COUNT(*) FROM tests t WHERE t.course_id=c.id) tests_count,
     (SELECT COUNT(*) FROM questions qn WHERE qn.course_id=c.id AND NOT qn.archived) questions_count
@@ -431,9 +557,17 @@ app.get('/api/courses',auth(),h(async(req,res)=>{
 app.get('/api/courses/catalog',auth('student'),h(async(req,res)=>{
   const u=req.user;
   res.json(await q(`SELECT c.*, f.name faculty_name, f.email faculty_email,
+    (SELECT string_agg(u2.name, ', ') FROM course_faculty cf2 JOIN users u2 ON u2.id=cf2.faculty_id WHERE cf2.course_id=c.id) faculty_names,
     EXISTS(SELECT 1 FROM enrollments e WHERE e.course_id=c.id AND e.student_id=$1) enrolled,
     (SELECT COUNT(*) FROM tests t WHERE t.course_id=c.id AND t.published=true) tests_count
     FROM courses c LEFT JOIN users f ON f.id=c.faculty_id ORDER BY c.id`,[u.id]));
+}));
+
+app.get('/api/courses/:id/students',auth('admin','faculty'),h(async(req,res)=>{
+  if(!(await ownsCourse(req.user,req.params.id)))return res.status(403).json({error:'Forbidden: You do not have permission to view students for this course'});
+  res.json(await q(`SELECT u.id, u.name, u.email, u.roll_number, u.department, u.year_sem, e.created_at enrolled_at
+    FROM enrollments e JOIN users u ON u.id=e.student_id
+    WHERE e.course_id=$1 ORDER BY u.name`,[req.params.id]));
 }));
 
 app.post('/api/courses/:id/self-enroll',auth('student'),h(async(req,res)=>{
@@ -442,18 +576,38 @@ app.post('/api/courses/:id/self-enroll',auth('student'),h(async(req,res)=>{
 }));
 
 app.post('/api/courses',auth('admin','faculty'),h(async(req,res)=>{
-  const{code,name,faculty_id}=req.body;
-  const fid=faculty_id||req.user.id;
-  const[c]=await q('INSERT INTO courses(code,name,faculty_id) VALUES($1,$2,$3) RETURNING *',[code,name,fid]);
+  const{code,name,faculty_id,faculty_ids}=req.body;
+  const fids = Array.isArray(faculty_ids) && faculty_ids.length ? faculty_ids.map(Number) : [Number(faculty_id||req.user.id)];
+  const primaryFid = fids[0] || req.user.id;
+  const[c]=await q('INSERT INTO courses(code,name,faculty_id) VALUES($1,$2,$3) RETURNING *',[code,name,primaryFid]);
+  for(const fid of fids){
+    await q('INSERT INTO course_faculty(course_id, faculty_id) VALUES($1,$2) ON CONFLICT DO NOTHING',[c.id, fid]);
+  }
   res.status(201).json(c);
 }));
 
 app.put('/api/courses/:id',auth('admin','faculty'),h(async(req,res)=>{
   if(!(await ownsCourse(req.user,req.params.id)))return res.status(403).json({error:'Forbidden: You do not have permission to manage this course'});
-  const{code,name,faculty_id}=req.body;
-  const fid=isAdmin(req.user)?(faculty_id||req.user.id):req.user.id;
-  const[c]=await q('UPDATE courses SET code=$1, name=$2, faculty_id=$3 WHERE id=$4 RETURNING *',[code,name,fid,req.params.id]);
+  const{code,name,faculty_id,faculty_ids}=req.body;
+  let primaryFid;
+  if(Array.isArray(faculty_ids) && faculty_ids.length){
+    primaryFid = Number(faculty_ids[0]);
+  } else if(faculty_id){
+    primaryFid = Number(faculty_id);
+  } else if(!isAdmin(req.user)){
+    primaryFid = req.user.id;
+  }
+  const[c]=await q('UPDATE courses SET code=$1, name=$2, faculty_id=COALESCE($3, faculty_id) WHERE id=$4 RETURNING *',[code,name,primaryFid||null,req.params.id]);
   if(!c)return res.status(404).json({error:'Course not found'});
+
+  if(Array.isArray(faculty_ids)){
+    await q('DELETE FROM course_faculty WHERE course_id=$1',[req.params.id]);
+    for(const fid of faculty_ids){
+      await q('INSERT INTO course_faculty(course_id, faculty_id) VALUES($1,$2) ON CONFLICT DO NOTHING',[req.params.id, Number(fid)]);
+    }
+  } else if(faculty_id){
+    await q('INSERT INTO course_faculty(course_id, faculty_id) VALUES($1,$2) ON CONFLICT DO NOTHING',[req.params.id, Number(faculty_id)]);
+  }
   res.json(c);
 }));
 
@@ -469,6 +623,7 @@ app.delete('/api/courses/:id',auth('admin'),h(async(req,res)=>{
     await c.query('DELETE FROM tests WHERE course_id=$1',[cid]);
     await c.query('DELETE FROM questions WHERE course_id=$1',[cid]);
     await c.query('DELETE FROM enrollments WHERE course_id=$1',[cid]);
+    await c.query('DELETE FROM course_faculty WHERE course_id=$1',[cid]);
     await c.query('DELETE FROM courses WHERE id=$1',[cid]);
     await c.query('COMMIT');
     res.json({deleted:true});
@@ -493,9 +648,16 @@ app.post('/api/questions',auth('admin','faculty'),h(async(req,res)=>{
 app.get('/api/questions',auth('admin','faculty'),h(async(req,res)=>{
   const cid=req.query.course_id;
   if(cid){
+    if(!(await ownsCourse(req.user, cid))) return res.status(403).json({error:'Forbidden: You can only view questions for courses you manage'});
     return res.json(await q('SELECT * FROM questions WHERE course_id=$1 AND NOT archived ORDER BY id DESC',[cid]));
   }
-  res.json(await q('SELECT * FROM questions WHERE NOT archived ORDER BY id DESC'));
+  if(isAdmin(req.user)){
+    return res.json(await q('SELECT * FROM questions WHERE NOT archived ORDER BY id DESC'));
+  }
+  res.json(await q(`SELECT q.* FROM questions q 
+    JOIN courses c ON c.id=q.course_id
+    WHERE NOT q.archived AND (q.created_by=$1 OR c.faculty_id=$1 OR EXISTS (SELECT 1 FROM course_faculty cf WHERE cf.course_id=c.id AND cf.faculty_id=$1))
+    ORDER BY q.id DESC`,[req.user.id]));
 }));
 
 app.put('/api/questions/:id',auth('admin','faculty'),h(async(req,res)=>{
@@ -511,6 +673,25 @@ app.delete('/api/questions/:id',auth('admin','faculty'),h(async(req,res)=>{
   if(!(await ownsQuestion(req.user,req.params.id)))return res.status(403).json({error:'Forbidden: You can only archive questions from courses you manage'});
   await q('UPDATE questions SET archived=true WHERE id=$1',[req.params.id]);
   res.json({deleted:true});
+}));
+
+app.post('/api/questions/bulk-delete',auth('admin','faculty'),h(async(req,res)=>{
+  const { question_ids } = req.body || {};
+  if(!Array.isArray(question_ids) || !question_ids.length){
+    return res.status(400).json({error:'No question IDs provided for deletion'});
+  }
+  const validIds = [];
+  for(const qid of question_ids){
+    if(await ownsQuestion(req.user, qid)){
+      validIds.push(Number(qid));
+    }
+  }
+  if(!validIds.length){
+    return res.status(403).json({error:'Forbidden: You do not have permission to delete the selected questions'});
+  }
+  await q('UPDATE questions SET archived=true WHERE id=ANY($1)',[validIds]);
+  await audit(req.user.id, 'questions.bulk_delete', { count: validIds.length, ids: validIds });
+  res.json({ success: true, count: validIds.length, ids: validIds });
 }));
 
 // Smart Text Extractor
@@ -659,7 +840,7 @@ app.get('/api/tests',auth(),h(async(req,res)=>{
       (SELECT COUNT(*) FROM enrollments e WHERE e.course_id=t.course_id) enrolled_count
       FROM tests t JOIN courses c ON c.id=t.course_id
       LEFT JOIN users u ON u.id=t.created_by
-      WHERE t.created_by=$1 OR c.faculty_id=$1
+      WHERE t.created_by=$1 OR c.faculty_id=$1 OR EXISTS (SELECT 1 FROM course_faculty cf WHERE cf.course_id=c.id AND cf.faculty_id=$1)
       ORDER BY t.id DESC`,[u.id]));
   }
   res.json(await q(`SELECT t.*, c.code course_code, c.name course_name, u.name creator_name,

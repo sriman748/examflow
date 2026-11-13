@@ -6,7 +6,7 @@ let S = {
 let activeTab = 0;
 let modalContent = null;
 let E = null; // Exam taking state
-let F = { course: 0, drafts: [], qs: [], selectedQs: new Set() }; // Faculty state
+let F = { course: 0, drafts: [], qs: [], selectedQs: new Set(), selectedBankQs: new Set() }; // Faculty state
 let timerInterval = null;
 let saverInterval = null;
 
@@ -1540,10 +1540,20 @@ async function renderAdmin() {
   } else if (activeTab === 1) {
     tabContent = `
       <div class="card">
-        <div class="card-header">
+        <div class="card-header" style="flex-wrap: wrap; gap: 1rem; align-items: center; justify-content: space-between;">
           <div>
-            <div class="card-title">User Directory (${users.length})</div>
+            <div class="card-title" id="user-dir-count">User Directory (${users.length})</div>
             <div class="card-subtitle">Edit profile details, reset passwords, change roles, or delete users</div>
+          </div>
+          <div style="display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center;">
+            <input type="text" id="user-search-input" placeholder="🔍 Search name, email, roll, dept..." 
+              class="form-control" style="min-width: 250px; padding: 0.45rem 0.85rem; font-size: 0.85rem;">
+            <select id="user-role-filter" class="form-control" style="width: auto; padding: 0.45rem 0.85rem; font-size: 0.85rem; font-weight: 600;">
+              <option value="all">All Roles (${users.length})</option>
+              <option value="faculty">👨‍🏫 Faculty (${users.filter(u => u.role === 'faculty').length})</option>
+              <option value="student">🎓 Students (${users.filter(u => u.role === 'student').length})</option>
+              <option value="admin">👑 Admins (${users.filter(u => u.role === 'admin').length})</option>
+            </select>
           </div>
         </div>
         <div class="table-responsive">
@@ -1558,11 +1568,14 @@ async function renderAdmin() {
                 <th>Manage</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody id="user-dir-tbody">
               ${users.map(u => `
-                <tr>
+                <tr data-user-id="${u.id}" data-role="${u.role}" data-search="${esc((u.name + ' ' + u.email + ' ' + (u.roll_number || '') + ' ' + (u.department || '') + ' ' + (u.employee_id || '')).toLowerCase())}">
                   <td><code>#${u.id}</code></td>
-                  <td><strong>${esc(u.name)}</strong></td>
+                  <td>
+                    <strong>${esc(u.name)}</strong>
+                    ${u.department ? `<div class="text-xs text-muted">${esc(u.department)}${u.roll_number ? ' • ' + esc(u.roll_number) : ''}</div>` : ''}
+                  </td>
                   <td>${esc(u.email)}</td>
                   <td><span class="badge ${u.role === 'admin' ? 'badge-danger' : u.role === 'faculty' ? 'badge-warning' : 'badge-info'}">${u.role}</span></td>
                   <td><span class="badge ${u.status === 'active' ? 'badge-success' : 'badge-danger'}">${u.status}</span></td>
@@ -1582,6 +1595,11 @@ async function renderAdmin() {
                   </td>
                 </tr>
               `).join('')}
+              <tr id="user-dir-empty-row" style="display: none;">
+                <td colspan="6" class="text-center text-muted" style="padding: 2.5rem;">
+                  No users found matching your search or role filter.
+                </td>
+              </tr>
             </tbody>
           </table>
         </div>
@@ -1593,7 +1611,7 @@ async function renderAdmin() {
         <div class="card-header">
           <div>
             <div class="card-title">Create Curriculum Course</div>
-            <div class="card-subtitle">Create a subject and assign an instructor</div>
+            <div class="card-subtitle">Create a subject and assign one or more instructors (Multi-Faculty Sharing)</div>
           </div>
         </div>
         <form data-f="mkcourse" class="form-row">
@@ -1605,14 +1623,16 @@ async function renderAdmin() {
             <label class="form-label">Course Title</label>
             <input type="text" name="name" class="form-control" placeholder="Distributed Operating Systems" required>
           </div>
-          <div>
-            <label class="form-label">Assigned Faculty</label>
-            <select name="faculty_id" class="form-control" required>
-              <option value="">Select Faculty...</option>
+          <div style="grid-column: span 2;">
+            <label class="form-label">Assigned Faculty (Select all who teach this course)</label>
+            <div style="display: flex; flex-wrap: wrap; gap: 0.5rem; max-height: 110px; overflow-y: auto; padding: 0.5rem; background: var(--surface-subtle); border: 1px solid var(--border); border-radius: var(--radius-sm);">
               ${users.filter(u => u.role === 'faculty').map(f => `
-                <option value="${f.id}">${esc(f.name)} (${esc(f.email)})</option>
+                <label style="display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.85rem; cursor: pointer; background: var(--surface); padding: 0.3rem 0.6rem; border-radius: 4px; border: 1px solid var(--border);">
+                  <input type="checkbox" name="faculty_ids" value="${f.id}">
+                  <span>👨‍🏫 ${esc(f.name)} <span class="text-xs text-muted">(${esc(f.email)})</span></span>
+                </label>
               `).join('')}
-            </select>
+            </div>
           </div>
           <div style="display: flex; align-items: flex-end;">
             <button type="submit" class="btn btn-primary" style="width: 100%;">Create Course</button>
@@ -1659,7 +1679,7 @@ async function renderAdmin() {
                 <th>ID</th>
                 <th>Course</th>
                 <th>Track</th>
-                <th>Instructor</th>
+                <th>Instructors</th>
                 <th>Students</th>
                 <th>Tests</th>
                 <th>Actions</th>
@@ -1668,6 +1688,7 @@ async function renderAdmin() {
             <tbody>
               ${courses.map(c => {
                 const theme = getCourseTheme(c.code, c.name);
+                const facultyDisplay = c.faculty_names || c.faculty_name;
                 return `
                   <tr>
                     <td><code>#${c.id}</code></td>
@@ -1676,8 +1697,17 @@ async function renderAdmin() {
                       <strong>${esc(c.name)}</strong>
                     </td>
                     <td><span class="text-sm text-muted">${theme.tag}</span></td>
-                    <td>${c.faculty_name ? `<strong>${esc(c.faculty_name)}</strong> <div class="text-sm text-muted">${esc(c.faculty_email)}</div>` : '<span class="text-muted">Unassigned</span>'}</td>
-                    <td><span class="badge badge-info">${c.students_count || 0} enrolled</span></td>
+                    <td>
+                      ${facultyDisplay ? `
+                        <strong>${esc(facultyDisplay)}</strong>
+                        ${c.faculty_list && c.faculty_list.length > 1 ? `<div class="text-xs text-muted">🤝 ${c.faculty_list.length} Faculty Shared</div>` : `<div class="text-sm text-muted">${esc(c.faculty_email || '')}</div>`}
+                      ` : '<span class="text-muted">Unassigned</span>'}
+                    </td>
+                    <td>
+                      <button class="btn btn-sm btn-info" data-a="view-course-students" data-id="${c.id}" data-name="${esc(c.name)}" title="Click to view enrolled student roster">
+                        👥 ${c.students_count || 0} enrolled
+                      </button>
+                    </td>
                     <td><span class="badge badge-primary">${c.tests_count || 0} tests</span></td>
                     <td>
                       <div class="flex gap-2">
@@ -1776,7 +1806,7 @@ async function renderAdmin() {
 async function renderFaculty() {
   const courses = await api('/courses');
   if (!F.course && courses.length > 0) {
-    const myCourse = (S.user && S.user.role === 'faculty') ? courses.find(c => c.faculty_id === S.user.id) : null;
+    const myCourse = (S.user && S.user.role === 'faculty') ? courses.find(c => c.faculty_id === S.user.id || (c.faculty_list && c.faculty_list.some(f => f && f.id === S.user.id))) : null;
     F.course = myCourse ? myCourse.id : courses[0].id;
   }
   
@@ -2086,15 +2116,33 @@ Explanation: Quicksort partitions the array recursively in O(n log n) average ti
           <div id="drafts" style="margin-top: 1.5rem;"></div>
         </div>
 
-        <div class="card-header" style="margin-top: 2rem;">
-          <div class="card-title">Stored Questions (${F.qs.length})</div>
-          <button class="btn btn-sm btn-primary" data-a="set-tab" data-tab="0">
-            🎯 Use in Exam Creator →
-          </button>
+        <div class="card-header" style="margin-top: 2rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.75rem;">
+          <div style="display: flex; align-items: center; gap: 1rem;">
+            <div class="card-title" style="margin: 0;">Stored Questions (${F.qs.length})</div>
+            ${F.qs.length ? `
+              <label style="display: flex; align-items: center; gap: 0.4rem; cursor: pointer; font-size: 0.88rem; font-weight: 600; user-select: none;">
+                <input type="checkbox" id="select-all-bank-qs" ${F.selectedBankQs && F.qs.length && F.selectedBankQs.size === F.qs.length ? 'checked' : ''}>
+                <span>Select All (${F.selectedBankQs ? F.selectedBankQs.size : 0}/${F.qs.length})</span>
+              </label>
+            ` : ''}
+          </div>
+          <div style="display: flex; gap: 0.5rem; align-items: center;">
+            ${(F.selectedBankQs && F.selectedBankQs.size > 0) ? `
+              <button class="btn btn-sm btn-danger" data-a="delete-selected-bank-qs">
+                🗑️ Delete Selected (${F.selectedBankQs.size})
+              </button>
+            ` : ''}
+            <button class="btn btn-sm btn-primary" data-a="set-tab" data-tab="0">
+              🎯 Use in Exam Creator →
+            </button>
+          </div>
         </div>
-        <div style="max-height: 450px; overflow-y: auto;">
-          ${F.qs.length ? F.qs.map((q, idx) => `
-            <div class="opt-card" style="margin-bottom: 0.65rem; display: flex; justify-content: space-between; align-items: center;">
+        <div style="max-height: 480px; overflow-y: auto;">
+          ${F.qs.length ? F.qs.map((q, idx) => {
+            const isChecked = F.selectedBankQs && F.selectedBankQs.has(q.id);
+            return `
+            <div class="opt-card" style="margin-bottom: 0.65rem; display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; border-left: ${isChecked ? '3px solid var(--danger, #ef4444)' : '1px solid var(--border)'};">
+              <input type="checkbox" class="bank-q-checkbox" data-qid="${q.id}" ${isChecked ? 'checked' : ''} style="cursor: pointer; transform: scale(1.15);">
               <div style="flex: 1;">
                 <div><strong>Q${idx + 1}. ${esc(q.text)}</strong></div>
                 <div class="text-sm text-muted" style="margin-top: 4px;">
@@ -2112,7 +2160,8 @@ Explanation: Quicksort partitions the array recursively in O(n log n) average ti
                 </button>
               </div>
             </div>
-          `).join('') : '<p class="text-muted text-center" style="padding: 2rem;">No questions added yet for this course. Use the extractor above!</p>'}
+          `;
+          }).join('') : '<p class="text-muted text-center" style="padding: 2rem;">No questions added yet for this course. Use the extractor above!</p>'}
         </div>
       </div>
     `;
@@ -2857,6 +2906,12 @@ document.addEventListener('click', async e => {
       const c = JSON.parse(target.dataset.course);
       const users = await api('/users');
       const faculties = users.filter(u => u.role === 'faculty');
+      const assignedIds = new Set();
+      if (c.faculty_list && Array.isArray(c.faculty_list)) {
+        c.faculty_list.forEach(fl => fl && assignedIds.add(fl.id));
+      }
+      if (c.faculty_id) assignedIds.add(c.faculty_id);
+
       modalContent = `
         <div class="modal-header">
           <div class="card-title">✏️ Edit Course #${c.id}</div>
@@ -2872,19 +2927,63 @@ document.addEventListener('click', async e => {
             <input type="text" name="name" class="form-control" value="${esc(c.name)}" required>
           </div>
           <div class="form-group">
-            <label class="form-label">Assigned Faculty Lead</label>
-            <select name="faculty_id" class="form-control">
-              <option value="">Unassigned</option>
+            <label class="form-label">Assigned Faculty (Select all who teach this course)</label>
+            <div style="display: flex; flex-direction: column; gap: 0.4rem; max-height: 180px; overflow-y: auto; padding: 0.6rem; background: var(--surface-subtle); border: 1px solid var(--border); border-radius: var(--radius-sm);">
               ${faculties.map(f => `
-                <option value="${f.id}" ${f.id == c.faculty_id ? 'selected' : ''}>${esc(f.name)} (${esc(f.email)})</option>
+                <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.88rem; cursor: pointer; background: var(--surface); padding: 0.4rem 0.65rem; border-radius: 4px; border: 1px solid var(--border);">
+                  <input type="checkbox" name="faculty_ids" value="${f.id}" ${assignedIds.has(f.id) ? 'checked' : ''}>
+                  <span><strong>${esc(f.name)}</strong> <span class="text-muted">(${esc(f.email)})</span></span>
+                </label>
               `).join('')}
-            </select>
+            </div>
           </div>
           <div class="flex justify-between items-center mt-4">
             <button type="button" class="btn btn-secondary" data-a="close-modal">Cancel</button>
             <button type="submit" class="btn btn-primary">Update Course</button>
           </div>
         </form>
+      `;
+      render();
+    } else if (action === 'view-course-students') {
+      const cid = target.dataset.id;
+      const cname = target.dataset.name;
+      const students = await api(`/courses/${cid}/students`);
+      modalContent = `
+        <div class="modal-header">
+          <div class="card-title">👥 Enrolled Students - ${esc(cname)} (${students.length})</div>
+          <button class="close-btn" data-a="close-modal">&times;</button>
+        </div>
+        <div style="max-height: 420px; overflow-y: auto;">
+          ${students.length ? `
+            <table style="width: 100%; border-collapse: collapse;">
+              <thead>
+                <tr style="border-bottom: 2px solid var(--border); text-align: left;">
+                  <th style="padding: 0.5rem;">ID</th>
+                  <th style="padding: 0.5rem;">Student Name</th>
+                  <th style="padding: 0.5rem;">Email</th>
+                  <th style="padding: 0.5rem;">Roll Number</th>
+                  <th style="padding: 0.5rem;">Department</th>
+                  <th style="padding: 0.5rem;">Enrolled</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${students.map(s => `
+                  <tr style="border-bottom: 1px solid var(--border);">
+                    <td style="padding: 0.5rem;"><code>#${s.id}</code></td>
+                    <td style="padding: 0.5rem;"><strong>${esc(s.name)}</strong></td>
+                    <td style="padding: 0.5rem;">${esc(s.email)}</td>
+                    <td style="padding: 0.5rem;">${esc(s.roll_number || '—')}</td>
+                    <td style="padding: 0.5rem;">${esc(s.department || '—')}</td>
+                    <td style="padding: 0.5rem;" class="text-sm text-muted">${new Date(s.enrolled_at).toLocaleDateString()}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          ` : '<p class="text-center text-muted" style="padding: 2.5rem;">No students enrolled yet in this curriculum course.</p>'}
+        </div>
+        <div class="flex justify-between items-center mt-4">
+          <button type="button" class="btn btn-secondary" data-a="close-modal">Close</button>
+        </div>
       `;
       render();
     } else if (action === 'delete-course') {
@@ -2941,7 +3040,16 @@ document.addEventListener('click', async e => {
     } else if (action === 'delete-q') {
       if (!confirm('Are you sure you want to remove this question?')) return;
       await api(`/questions/${target.dataset.id}`, 'DELETE');
+      if (F.selectedBankQs) F.selectedBankQs.delete(+target.dataset.id);
       toast('Question archived');
+      render();
+    } else if (action === 'delete-selected-bank-qs') {
+      if (!F.selectedBankQs || F.selectedBankQs.size === 0) return;
+      const count = F.selectedBankQs.size;
+      if (!confirm(`Are you sure you want to delete ${count} selected question(s)?`)) return;
+      await api('/questions/bulk-delete', 'POST', { question_ids: Array.from(F.selectedBankQs) });
+      F.selectedBankQs.clear();
+      toast(`Successfully deleted ${count} question(s)`);
       render();
     } else if (action === 'edit-q-modal') {
       const q = JSON.parse(target.dataset.q);
@@ -3330,11 +3438,25 @@ document.addEventListener('submit', async e => {
       toast('User profile updated successfully');
       render();
     } else if (fType === 'mkcourse') {
-      await api('/courses', 'POST', { ...formData, faculty_id: +formData.faculty_id });
+      const checkedFaculties = [...form.querySelectorAll('input[name="faculty_ids"]:checked')].map(cb => +cb.value);
+      const fid = checkedFaculties.length ? checkedFaculties[0] : (formData.faculty_id ? +formData.faculty_id : null);
+      await api('/courses', 'POST', {
+        code: formData.code,
+        name: formData.name,
+        faculty_id: fid,
+        faculty_ids: checkedFaculties.length ? checkedFaculties : (fid ? [fid] : [])
+      });
       toast('Course created successfully');
       render();
     } else if (fType === 'update-course') {
-      await api(`/courses/${form.dataset.id}`, 'PUT', { ...formData, faculty_id: formData.faculty_id ? +formData.faculty_id : null });
+      const checkedFaculties = [...form.querySelectorAll('input[name="faculty_ids"]:checked')].map(cb => +cb.value);
+      const fid = checkedFaculties.length ? checkedFaculties[0] : (formData.faculty_id ? +formData.faculty_id : null);
+      await api(`/courses/${form.dataset.id}`, 'PUT', {
+        code: formData.code,
+        name: formData.name,
+        faculty_id: fid,
+        faculty_ids: checkedFaculties.length ? checkedFaculties : (fid ? [fid] : [])
+      });
       modalContent = null;
       toast('Course details updated');
       render();
@@ -3397,8 +3519,65 @@ document.addEventListener('submit', async e => {
   }
 });
 
+// ---------- USER DIRECTORY FILTER HELPER ----------
+function applyUserDirectoryFilters() {
+  const query = (document.getElementById('user-search-input')?.value || '').toLowerCase().trim();
+  const role = document.getElementById('user-role-filter')?.value || 'all';
+  const rows = document.querySelectorAll('#user-dir-tbody tr[data-user-id]');
+  let visibleCount = 0;
+  rows.forEach(tr => {
+    const r = tr.dataset.role;
+    const text = tr.dataset.search || '';
+    const roleMatch = (role === 'all' || r === role);
+    const searchMatch = (!query || text.includes(query));
+    if (roleMatch && searchMatch) {
+      tr.style.display = '';
+      visibleCount++;
+    } else {
+      tr.style.display = 'none';
+    }
+  });
+  const emptyRow = document.getElementById('user-dir-empty-row');
+  if (emptyRow) {
+    emptyRow.style.display = visibleCount === 0 ? '' : 'none';
+  }
+  const countEl = document.getElementById('user-dir-count');
+  if (countEl) countEl.textContent = `User Directory (${visibleCount} shown)`;
+}
+
 // ---------- INPUT CHANGE LISTENERS ----------
 document.addEventListener('change', e => {
+  // Select All Bank Questions Checkbox
+  if (e.target.id === 'select-all-bank-qs') {
+    if (!F.selectedBankQs) F.selectedBankQs = new Set();
+    if (e.target.checked) {
+      F.qs.forEach(q => F.selectedBankQs.add(q.id));
+    } else {
+      F.selectedBankQs.clear();
+    }
+    render();
+    return;
+  }
+
+  // Single Bank Question Checkbox
+  if (e.target.classList.contains('bank-q-checkbox')) {
+    if (!F.selectedBankQs) F.selectedBankQs = new Set();
+    const qid = +e.target.dataset.qid;
+    if (e.target.checked) {
+      F.selectedBankQs.add(qid);
+    } else {
+      F.selectedBankQs.delete(qid);
+    }
+    render();
+    return;
+  }
+
+  // User Directory Role Filter
+  if (e.target.id === 'user-role-filter') {
+    applyUserDirectoryFilters();
+    return;
+  }
+
   // Extractor File Upload Changed
   if (e.target.id === 'extractor-file-input') {
     const file = e.target.files && e.target.files[0];
@@ -3410,6 +3589,7 @@ document.addEventListener('change', e => {
   if (e.target.dataset.c !== undefined) {
     F.course = +e.target.value;
     F.selectedQs.clear();
+    if (F.selectedBankQs) F.selectedBankQs.clear();
     render();
     return;
   }
@@ -3455,8 +3635,13 @@ document.addEventListener('drop', e => {
   }
 });
 
-// Exam Option Selection listener (during active student exam)
+// Input event listeners (Live User Directory search, Exam Option Selection)
 document.addEventListener('input', e => {
+  if (e.target.id === 'user-search-input') {
+    applyUserDirectoryFilters();
+    return;
+  }
+
   const container = e.target.closest('[data-qid]');
   if (!container || !E) return;
   const qid = +container.dataset.qid;

@@ -82,6 +82,23 @@ async function migrate() {
       console.log('[Migrate] Database schema and records verified.');
     }
 
+    // Ensure course_faculty table exists for multi-faculty course allocation
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS public.course_faculty (
+        course_id INT NOT NULL REFERENCES public.courses(id) ON DELETE CASCADE,
+        faculty_id INT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+        PRIMARY KEY(course_id, faculty_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_course_faculty_course ON public.course_faculty(course_id);
+      CREATE INDEX IF NOT EXISTS idx_course_faculty_faculty ON public.course_faculty(faculty_id);
+
+      INSERT INTO public.course_faculty(course_id, faculty_id)
+      SELECT id, faculty_id FROM public.courses WHERE faculty_id IS NOT NULL
+      ON CONFLICT DO NOTHING;
+
+      ALTER TABLE public.enrollments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();
+    `);
+
     // Always ensure Admin user is properly configured and unlocked
     const adminEmail = (process.env.ADMIN_EMAIL || 'sriman_cse@mvsrec.edu.in').toLowerCase().trim();
     const adminPass = process.env.ADMIN_PASSWORD || 'Sparky@748';
