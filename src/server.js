@@ -2,16 +2,21 @@ require('dotenv').config();
 const path = require('path');
 const express = require('express'), helmet = require('helmet'), rateLimit = require('express-rate-limit'),
   jwt = require('jsonwebtoken'), bcrypt = require('bcryptjs'), { Pool } = require('pg'), crypto = require('crypto'),
-  multer = require('multer'), pdfParse = require('pdf-parse'), mammoth = require('mammoth');
+  multer = require('multer'), pdfParse = require('pdf-parse'), mammoth = require('mammoth'),
+  compression = require('compression');
 
 const dbUrl = process.env.POSTGRES_URL || process.env.POSTGRES_PRISMA_URL || process.env.DATABASE_URL;
 let pool = null;
 if (dbUrl) {
   const isLocalDb = dbUrl.includes('localhost') || dbUrl.includes('127.0.0.1');
+  const maxPool = parseInt(process.env.PG_MAX_POOL || (isLocalDb ? '60' : '30'), 10);
   pool = new Pool({
     connectionString: dbUrl,
     ssl: isLocalDb ? false : { rejectUnauthorized: false },
-    max: 20
+    max: maxPool,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 8000,
+    statement_timeout: 15000
   });
   pool.on('error', (err) => console.error('pg pool error:', err.message));
 }
@@ -53,9 +58,41 @@ const q = async (s, p, c = pool) => {
   return (await c.query(s, p)).rows;
 };
 
+// In-Memory Test Questions Cache (0ms query bypass for 1,000 concurrent test takers)
+const TEST_CACHE = new Map();
+const TEST_CACHE_TTL = 30000;
+
+async function getCachedTestQuestions(testId) {
+  const cached = TEST_CACHE.get(+testId);
+  const now = Date.now();
+  if (cached && (now - cached.timestamp < TEST_CACHE_TTL)) {
+    return cached.questions;
+  }
+  const qs = await q(`
+    SELECT qn.id, qn.type, qn.text, qn.options, qn.marks 
+    FROM test_questions tq 
+    JOIN questions qn ON qn.id = tq.question_id 
+    WHERE tq.test_id = $1 
+    ORDER BY tq.position
+  `, [testId]);
+  TEST_CACHE.set(+testId, { questions: qs, timestamp: now });
+  return qs;
+}
+
+function invalidateTestCache(testId) {
+  if (testId) TEST_CACHE.delete(+testId);
+  else TEST_CACHE.clear();
+}
+
 const app = express();
-app.use(helmet({ contentSecurityPolicy: false }), express.json({ limit: '20mb' }));
-app.use(express.static(path.join(__dirname, '../public')));
+app.use(compression({ threshold: 1024, level: 6 }));
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(express.json({ limit: '20mb' }));
+app.use(express.static(path.join(__dirname, '../public'), {
+  maxAge: '1h',
+  etag: true,
+  lastModified: true
+}));
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -63,14 +100,36 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     environment: process.env.NODE_ENV || 'development',
     database_connected: !!pool,
+    pool_total: pool ? pool.totalCount : 0,
+    pool_idle: pool ? pool.idleCount : 0,
+    pool_waiting: pool ? pool.waitingCount : 0,
     timestamp: new Date().toISOString()
   });
 });
 
-// Rate limiting with support for shared campus IP / NAT
-const authKey = req => (req.headers.authorization || req.ip);
-app.use('/api/auth/login', rateLimit({ windowMs: 60000, max: 100, keyGenerator: req => req.ip }));
-app.use('/api', rateLimit({ windowMs: 60000, max: 3000, keyGenerator: authKey }));
+// Rate limiting with support for shared campus IP / NAT & 1,000+ concurrent students
+app.use('/api/auth/login', rateLimit({
+  windowMs: 60 * 1000,
+  max: 3000, // allow up to 3,000 logins/min from shared campus NAT
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: req => (req.body && req.body.email ? `login_${String(req.body.email).toLowerCase().trim()}` : req.ip)
+}));
+
+app.use('/api', rateLimit({
+  windowMs: 60 * 1000,
+  max: 60000, // 60,000 requests/min for 1,000 active students writing exams
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: req => {
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      return authHeader.slice(7, 36);
+    }
+    return req.ip;
+  }
+}));
+
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 const h=f=>(req,res,next)=>f(req,res,next).catch(next);
@@ -381,7 +440,9 @@ app.post('/api/auth/login',h(async(req,res)=>{
     if(u)await q("UPDATE users SET failed_logins=failed_logins+1,locked_until=CASE WHEN failed_logins+1>=5 THEN now()+interval '15 minutes' END WHERE id=$1",[u.id]);
     return res.status(401).json({error:'Invalid credentials'});
   }
-  await q('UPDATE users SET failed_logins=0,locked_until=NULL WHERE id=$1',[u.id]);
+  if (u.failed_logins > 0 || u.locked_until) {
+    await q('UPDATE users SET failed_logins=0,locked_until=NULL WHERE id=$1',[u.id]);
+  }
   res.json({token:jwt.sign({id:u.id,role:u.role},SECRET,{expiresIn:'2h'}),user:userProfile(u)});
 }));
 
@@ -438,7 +499,9 @@ app.post('/api/auth/google',h(async(req,res)=>{
   }
 
   if(u.status!=='active') return res.status(403).json({error:'Your account is deactivated or suspended'});
-  await q('UPDATE users SET failed_logins=0,locked_until=NULL WHERE id=$1',[u.id]);
+  if (u.failed_logins > 0 || u.locked_until) {
+    await q('UPDATE users SET failed_logins=0,locked_until=NULL WHERE id=$1',[u.id]);
+  }
   res.json({token:jwt.sign({id:u.id,role:u.role},SECRET,{expiresIn:'2h'}),user:userProfile(u)});
 }));
 
@@ -884,14 +947,27 @@ async function finalize(attemptId){
     let score=0,total=0,ok=0,bad=0,none=0;
     for(const r of rows){total+=+r.marks;const v=isCorrect(r,r.answer);
       if(v===true){score+=+r.marks;ok++}else if(v===false){score-=+r.negative_marks;bad++}else none++}
-    await q('INSERT INTO results VALUES($1,$2,$3,$4,$5,$6,$7)',[attemptId,score,total,ok,bad,none,score>=a.pass_marks],c);
+    await q(`INSERT INTO results(attempt_id,score,total,correct,wrong,unattempted,passed)
+      VALUES($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT(attempt_id) DO UPDATE 
+      SET score=EXCLUDED.score, total=EXCLUDED.total, correct=EXCLUDED.correct, wrong=EXCLUDED.wrong, unattempted=EXCLUDED.unattempted, passed=EXCLUDED.passed`,
+      [attemptId,score,total,ok,bad,none,score>=a.pass_marks],c);
     await q('UPDATE attempts SET submitted_at=LEAST(now(),deadline) WHERE id=$1',[attemptId],c);await c.query('COMMIT')
   }catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}
 
-setInterval(()=>{
-  if(!pool)return;
-  q('SELECT id FROM attempts WHERE submitted_at IS NULL AND deadline<now()').then(r=>Promise.all(r.map(x=>finalize(x.id)))).catch(console.error);
-},15000);
+setInterval(async () => {
+  if (!pool) return;
+  try {
+    const expired = await q('SELECT id FROM attempts WHERE submitted_at IS NULL AND deadline < now() LIMIT 100');
+    if (!expired || !expired.length) return;
+    for (let i = 0; i < expired.length; i += 10) {
+      const slice = expired.slice(i, i + 10);
+      await Promise.all(slice.map(x => finalize(x.id).catch(err => console.error('[Auto-finalize error]:', err.message))));
+    }
+  } catch (err) {
+    console.error('[Auto-finalize loop error]:', err.message);
+  }
+}, 15000);
 
 // ---- PROCTORING & ANTI-CHEATING CONTROLS ----
 app.post('/api/attempts/:id/warning',auth('student'),h(async(req,res)=>{
@@ -958,8 +1034,8 @@ app.post('/api/tests/:id/start',auth('student'),h(async(req,res)=>{
       warnings_count: a.warnings_count
     });
   }
-  let qs=await q('SELECT qn.id,qn.type,qn.text,qn.options,qn.marks FROM test_questions tq JOIN questions qn ON qn.id=tq.question_id WHERE tq.test_id=$1 ORDER BY tq.position',[t.id]);
-  if(t.shuffle)qs=shuffle(qs,a.id);
+  let qs = await getCachedTestQuestions(t.id);
+  if(t.shuffle) qs = shuffle(qs, a.id);
   const saved=await q('SELECT question_id,answer,marked FROM responses WHERE attempt_id=$1',[a.id]);
   res.json({
     attempt_id:a.id,
@@ -974,14 +1050,42 @@ app.post('/api/tests/:id/start',auth('student'),h(async(req,res)=>{
   })}));
 
 app.put('/api/attempts/:id/answers',auth('student'),h(async(req,res)=>{
-  const[a]=await q('SELECT * FROM attempts WHERE id=$1 AND student_id=$2',[req.params.id,req.user.id]);
+  const[a]=await q('SELECT id, test_id, is_blocked, submitted_at, deadline FROM attempts WHERE id=$1 AND student_id=$2',[req.params.id,req.user.id]);
   if(!a)return res.status(404).json({error:'Not found'});
   if(a.is_blocked)return res.status(403).json({error:'Exam attempt is blocked by proctoring system',is_blocked:true});
   if(a.submitted_at||a.deadline<=new Date())return res.status(409).json({error:'Attempt closed'});
-  const list=Array.isArray(req.body)?req.body:[req.body];
-  for(const r of list)await q(`INSERT INTO responses(attempt_id,question_id,answer,marked) SELECT $1,$2,$3,$4 WHERE EXISTS(SELECT 1 FROM test_questions WHERE test_id=$5 AND question_id=$2)
-    ON CONFLICT(attempt_id,question_id) DO UPDATE SET answer=EXCLUDED.answer,marked=EXCLUDED.marked,updated_at=now()`,[a.id,r.question_id,JSON.stringify(r.answer??null),!!r.marked,a.test_id]);
-  res.json({saved:list.length})}));
+
+  const list = Array.isArray(req.body) ? req.body : [req.body];
+  if (!list.length) return res.json({ saved: 0 });
+
+  const qids = [];
+  const answers = [];
+  const markeds = [];
+  for (const item of list) {
+    if (item && item.question_id != null) {
+      qids.push(+item.question_id);
+      answers.push(JSON.stringify(item.answer ?? null));
+      markeds.push(Boolean(item.marked));
+    }
+  }
+
+  if (qids.length > 0) {
+    await q(`
+      INSERT INTO responses(attempt_id, question_id, answer, marked, updated_at)
+      SELECT $1, u.qid, u.ans::jsonb, u.mk, now()
+      FROM unnest($2::int[], $3::text[], $4::boolean[]) AS u(qid, ans, mk)
+      WHERE EXISTS (
+        SELECT 1 FROM test_questions WHERE test_id = $5 AND question_id = u.qid
+      )
+      ON CONFLICT(attempt_id, question_id) DO UPDATE 
+      SET answer = EXCLUDED.answer,
+          marked = EXCLUDED.marked,
+          updated_at = now()
+    `, [a.id, qids, answers, markeds, a.test_id]);
+  }
+
+  res.json({ saved: qids.length });
+}));
 
 app.post('/api/attempts/:id/submit',auth('student'),h(async(req,res)=>{
   const[a]=await q('SELECT id FROM attempts WHERE id=$1 AND student_id=$2',[req.params.id,req.user.id]);
@@ -1009,7 +1113,9 @@ app.use((e,req,res,next)=>{
   res.status(e.status||500).json({error:e.message||'Server error'});
 });
 
-const PORT=process.env.PORT||3000;
-app.listen(PORT,()=>console.log('ExamFlow API up on port '+PORT));
+const PORT = process.env.PORT || 3000;
+const server = app.listen(PORT, () => console.log('ExamFlow API up on port ' + PORT));
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
 
 module.exports = app;

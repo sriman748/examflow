@@ -102,6 +102,22 @@ async function migrate() {
       ALTER TABLE public.attempts ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN DEFAULT false;
       ALTER TABLE public.attempts ADD COLUMN IF NOT EXISTS blocked_reason TEXT DEFAULT NULL;
       ALTER TABLE public.attempts ADD COLUMN IF NOT EXISTS tab_switches INT DEFAULT 0;
+
+      -- High-Concurrency Indexes for 1,000+ Concurrent Students
+      CREATE INDEX IF NOT EXISTS idx_enrollments_student_course ON public.enrollments(student_id, course_id);
+      CREATE INDEX IF NOT EXISTS idx_enrollments_course ON public.enrollments(course_id);
+      CREATE INDEX IF NOT EXISTS idx_tests_published_course ON public.tests(published, course_id, start_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_tests_share_code ON public.tests(share_code);
+      CREATE INDEX IF NOT EXISTS idx_test_questions_test_pos ON public.test_questions(test_id, position);
+      CREATE INDEX IF NOT EXISTS idx_test_questions_qid ON public.test_questions(question_id);
+      CREATE INDEX IF NOT EXISTS idx_questions_course ON public.questions(course_id) WHERE archived = false;
+      CREATE INDEX IF NOT EXISTS idx_attempts_student_test ON public.attempts(student_id, test_id);
+      CREATE INDEX IF NOT EXISTS idx_attempts_test_submitted ON public.attempts(test_id, submitted_at);
+      CREATE INDEX IF NOT EXISTS idx_attempts_auto_finalize ON public.attempts(id, deadline) WHERE submitted_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_responses_attempt ON public.responses(attempt_id);
+      CREATE INDEX IF NOT EXISTS idx_results_attempt ON public.results(attempt_id);
+      CREATE INDEX IF NOT EXISTS idx_users_role_status ON public.users(role, status);
+      CREATE INDEX IF NOT EXISTS idx_audit_logs_user_at ON public.audit_logs(user_id, at DESC);
     `);
 
     // Always ensure Admin user is properly configured and unlocked
