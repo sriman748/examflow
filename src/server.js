@@ -1019,7 +1019,11 @@ app.post('/api/attempts/:id/block',auth('admin','faculty'),h(async(req,res)=>{
 }));
 
 app.post('/api/tests/:id/start',auth('student'),h(async(req,res)=>{
-  const[t]=await q('SELECT t.* FROM tests t JOIN enrollments e ON e.course_id=t.course_id AND e.student_id=$2 WHERE t.id=$1 AND t.published',[req.params.id,req.user.id]);
+  const[t]=await q(`SELECT t.*, c.name course_name, c.code course_code 
+    FROM tests t 
+    JOIN enrollments e ON e.course_id=t.course_id AND e.student_id=$2 
+    JOIN courses c ON c.id=t.course_id
+    WHERE t.id=$1 AND t.published`,[req.params.id,req.user.id]);
   if(!t)return res.status(404).json({error:'Test not available or you are not enrolled'});
   const now=new Date();if(now<t.start_at||now>t.end_at)return res.status(403).json({error:'Outside test window'});
   const deadline=new Date(Math.min(+now+t.duration_min*60000,+t.end_at));
@@ -1039,6 +1043,10 @@ app.post('/api/tests/:id/start',auth('student'),h(async(req,res)=>{
   const saved=await q('SELECT question_id,answer,marked FROM responses WHERE attempt_id=$1',[a.id]);
   res.json({
     attempt_id:a.id,
+    test_id:t.id,
+    test_title:t.title,
+    course_name:t.course_name,
+    course_code:t.course_code,
     deadline:a.deadline,
     server_time:now,
     per_question_timer:t.per_question_timer||0,

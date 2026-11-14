@@ -311,6 +311,38 @@ function shell(content, options = {}) {
         </div>
       </div>
     ` : ''}
+
+    ${!E ? `
+      <nav class="mobile-bottom-nav">
+        <a href="#/" class="mobile-nav-item ${isHome ? 'active' : ''}">
+          <span class="mobile-nav-icon">🏠</span>
+          <span>Home</span>
+        </a>
+        <a href="#/features" class="mobile-nav-item ${isFeatures ? 'active' : ''}">
+          <span class="mobile-nav-icon">⚡</span>
+          <span>Features</span>
+        </a>
+        ${S.user ? `
+          <a href="#/dashboard" class="mobile-nav-item ${isDashboard ? 'active' : ''}">
+            <span class="mobile-nav-icon">📊</span>
+            <span>Dashboard</span>
+          </a>
+          <a href="#/profile" class="mobile-nav-item ${isProfile ? 'active' : ''}">
+            <span class="mobile-nav-icon">👤</span>
+            <span>Profile</span>
+          </a>
+        ` : `
+          <a href="#/login" class="mobile-nav-item ${hash === '#/login' ? 'active' : ''}">
+            <span class="mobile-nav-icon">🔑</span>
+            <span>Sign In</span>
+          </a>
+          <a href="#/register" class="mobile-nav-item ${hash === '#/register' ? 'active' : ''}">
+            <span class="mobile-nav-icon">🎓</span>
+            <span>Register</span>
+          </a>
+        `}
+      </nav>
+    ` : ''}
   `;
 }
 
@@ -318,6 +350,7 @@ function shell(content, options = {}) {
 window.addEventListener('hashchange', render);
 
 async function render() {
+  document.body.classList.toggle('in-exam', !!E);
   const hash = window.location.hash || '';
 
   // Public Share Join Route: #/join/CODE
@@ -3029,12 +3062,12 @@ function renderExamTaker() {
         </div>
       </div>
 
-      <div class="flex justify-between items-center">
+      <div class="exam-nav-bar flex justify-between items-center">
         <button class="btn btn-secondary" data-a="nav-q" data-dir="-1" ${E.i === 0 ? 'disabled' : ''}>
           ← Previous
         </button>
         <button class="btn ${isMarked ? 'btn-warning' : 'btn-outline'}" data-a="toggle-mark">
-          ${isMarked ? '🚩 Marked for Review' : '⚐ Mark for Review'}
+          ${isMarked ? '🚩 Marked' : '⚐ Mark for Review'}
         </button>
         <button class="btn btn-primary" data-a="nav-q" data-dir="1" ${E.i === E.qs.length - 1 ? 'disabled' : ''}>
           Next Question →
@@ -3249,7 +3282,7 @@ function renderExamBlockedModal() {
         <button type="button" class="btn btn-primary" id="btn-check-unblock-status" style="padding: 0.75rem 1.5rem;">
           🔄 Check if Faculty Unblocked You
         </button>
-        <button type="button" class="btn btn-secondary" id="btn-exit-to-dash">
+        <button type="button" class="btn btn-secondary" id="btn-exit-to-dash" data-a="exit-to-dash">
           Back to Dashboard
         </button>
       </div>
@@ -3279,11 +3312,76 @@ function renderExamBlockedModal() {
   });
 
   document.getElementById('btn-exit-to-dash')?.addEventListener('click', () => {
+    overlay.remove();
     cleanupProctoringListeners();
     E = null;
     window.location.hash = '#/dashboard';
     render();
   });
+}
+
+function renderExamCompletedScreen(info) {
+  document.body.classList.remove('in-exam');
+  const app = document.getElementById('app');
+  if (!app) return;
+
+  app.innerHTML = shell(`
+    <div class="container" style="max-width: 680px; margin: 2rem auto; text-align: center;">
+      <div class="card" style="padding: 2.5rem 1.75rem; border-top: 5px solid var(--success, #10b981); box-shadow: var(--shadow-xl); border-radius: var(--radius-lg);">
+        <div style="width: 72px; height: 72px; border-radius: 50%; background: #ecfdf5; color: #10b981; display: inline-flex; align-items: center; justify-content: center; font-size: 2.5rem; margin-bottom: 1.25rem;">
+          ✓
+        </div>
+        
+        <h1 style="font-size: 1.85rem; font-weight: 800; color: var(--text-main); margin-bottom: 0.5rem;">
+          ${info.auto ? 'Exam Automatically Finalized' : 'Exam Submitted Successfully!'}
+        </h1>
+        <p class="text-muted" style="margin-bottom: 1.75rem; font-size: 1rem; line-height: 1.5;">
+          ${info.auto 
+            ? 'The scheduled examination time has elapsed. All your saved responses were securely recorded.' 
+            : 'Your examination responses have been cryptographically verified and recorded in the academic database.'}
+        </p>
+
+        <!-- Official Submission Receipt Details -->
+        <div style="background: var(--surface-subtle); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 1.25rem; text-align: left; margin-bottom: 1.75rem;">
+          <div style="font-weight: 700; font-size: 0.82rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.85rem; border-bottom: 1px solid var(--border); padding-bottom: 0.4rem;">
+            📄 Official Submission Receipt
+          </div>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.85rem; font-size: 0.92rem;">
+            <div>
+              <span class="text-muted text-xs">Exam Title:</span>
+              <div style="font-weight: 700; color: var(--text-main);">${esc(info.testTitle)}</div>
+            </div>
+            <div>
+              <span class="text-muted text-xs">Course:</span>
+              <div style="font-weight: 700; color: var(--text-main);">${esc(info.courseCode || '')} ${esc(info.courseName)}</div>
+            </div>
+            <div>
+              <span class="text-muted text-xs">Questions Answered:</span>
+              <div style="font-weight: 700; color: #047857;">${info.answeredCount} / ${info.totalQuestions} Questions</div>
+            </div>
+            <div>
+              <span class="text-muted text-xs">Submission Timestamp:</span>
+              <div style="font-weight: 700; color: var(--text-main);">${esc(info.submittedAt)}</div>
+            </div>
+          </div>
+          <div style="margin-top: 0.85rem; padding-top: 0.75rem; border-top: 1px dashed var(--border); font-size: 0.82rem; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
+            <span>Attempt Ref: <code>#ATT-${info.attemptId}</code></span>
+            <span class="badge badge-success">✓ Verified & Recorded</span>
+          </div>
+        </div>
+
+        <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: var(--radius-md); padding: 0.85rem 1rem; font-size: 0.88rem; color: #1e40af; margin-bottom: 2rem; text-align: left; display: flex; gap: 0.65rem; align-items: center;">
+          <span style="font-size: 1.3rem;">ℹ️</span>
+          <span>Official scorecard and rankings will be available in your <strong>Completed Submissions</strong> dashboard once released by the instructor.</span>
+        </div>
+
+        <!-- The Confirmation and Exit Action Button -->
+        <button type="button" class="btn btn-primary" data-a="confirm-and-exit" style="width: 100%; font-size: 1.05rem; padding: 0.9rem 1.5rem; font-weight: 700; box-shadow: var(--shadow-md);">
+          ✓ Confirm & Exit to Dashboard
+        </button>
+      </div>
+    </div>
+  `);
 }
 
 async function flushExamAnswers() {
@@ -3314,6 +3412,16 @@ async function submitExam(auto = false) {
   E.busy = true;
   cleanupProctoringListeners();
   await flushExamAnswers();
+  const summaryInfo = {
+    attemptId: E.att,
+    testTitle: E.testTitle || 'Academic Examination',
+    courseName: E.courseName || '',
+    courseCode: E.courseCode || '',
+    totalQuestions: E.qs ? E.qs.length : 0,
+    answeredCount: Object.keys(E.ans).filter(k => E.ans[k] !== null && E.ans[k] !== '').length,
+    submittedAt: new Date().toLocaleTimeString(),
+    auto: auto
+  };
   try {
     await api(`/attempts/${E.att}/submit`, 'POST');
     clearInterval(timerInterval);
@@ -3321,9 +3429,10 @@ async function submitExam(auto = false) {
     E = null;
     modalContent = null;
     toast(auto ? 'Time elapsed. Exam submitted automatically.' : 'Exam submitted successfully!');
-    await render();
+    renderExamCompletedScreen(summaryInfo);
   } catch (err) {
     E.busy = false;
+    toast(err.message || 'Error submitting examination', 'error');
   }
 }
 
@@ -3713,6 +3822,10 @@ document.addEventListener('click', async e => {
       if (res.is_blocked) {
         E = {
           att: res.attempt_id,
+          testId: res.test_id || testId,
+          testTitle: res.test_title || target.dataset.title || 'Academic Examination',
+          courseName: res.course_name || '',
+          courseCode: res.course_code || '',
           qs: res.questions,
           i: 0,
           ans: {},
@@ -3731,6 +3844,10 @@ document.addEventListener('click', async e => {
       }
       E = {
         att: res.attempt_id,
+        testId: res.test_id || testId,
+        testTitle: res.test_title || target.dataset.title || 'Academic Examination',
+        courseName: res.course_name || '',
+        courseCode: res.course_code || '',
         qs: res.questions,
         i: 0,
         ans: {},
@@ -3770,20 +3887,49 @@ document.addEventListener('click', async e => {
       E.pend[qid] = { question_id: qid, answer: E.ans[qid] ?? null, marked: !!E.mk[qid] };
       renderExamTaker();
     } else if (action === 'submit-exam-confirm') {
+      const totalQ = E ? E.qs.length : 0;
+      const ansCount = E ? Object.keys(E.ans).filter(k => E.ans[k] !== null && E.ans[k] !== '').length : 0;
+      const unansCount = totalQ - ansCount;
+      const markedCount = E ? Object.keys(E.mk).filter(k => E.mk[k]).length : 0;
       modalContent = `
         <div class="modal-header">
           <div class="card-title">⚠️ Confirm Test Submission</div>
           <button class="close-btn" data-a="close-modal">&times;</button>
         </div>
-        <p class="mb-4">Are you sure you want to finish and submit your exam? You cannot change your answers after submission.</p>
-        <div class="flex justify-between items-center">
-          <button class="btn btn-secondary" data-a="close-modal">Continue Test</button>
-          <button class="btn btn-danger" data-a="submit-exam-final">Confirm & Submit</button>
+        <p class="mb-3" style="color: var(--text-main);">
+          Are you sure you want to finish and submit your exam? All your answers will be securely sealed in the academic database.
+        </p>
+        <div style="background: var(--surface-subtle); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.85rem 1rem; margin-bottom: 1.25rem; font-size: 0.88rem; display: flex; justify-content: space-around; text-align: center;">
+          <div>
+            <div style="font-weight: 800; font-size: 1.25rem; color: #047857;">${ansCount}</div>
+            <div class="text-xs text-muted">Answered</div>
+          </div>
+          <div>
+            <div style="font-weight: 800; font-size: 1.25rem; color: ${unansCount > 0 ? '#b91c1c' : 'var(--text-muted)'};">${unansCount}</div>
+            <div class="text-xs text-muted">Unanswered</div>
+          </div>
+          <div>
+            <div style="font-weight: 800; font-size: 1.25rem; color: #b45309;">${markedCount}</div>
+            <div class="text-xs text-muted">Marked</div>
+          </div>
+        </div>
+        <div class="flex justify-between items-center gap-2" style="flex-wrap: wrap;">
+          <button type="button" class="btn btn-secondary" data-a="close-modal">← Continue Test</button>
+          <button type="button" class="btn btn-danger" data-a="submit-exam-final">✓ Confirm & Submit Exam</button>
         </div>
       `;
       render();
     } else if (action === 'submit-exam-final') {
       submitExam(false);
+    } else if (action === 'confirm-and-exit' || action === 'exit-completed-exam') {
+      window.location.hash = '#/dashboard';
+      activeTab = 1;
+      await render();
+    } else if (action === 'exit-to-dash') {
+      cleanupProctoringListeners();
+      E = null;
+      window.location.hash = '#/dashboard';
+      await render();
     } else if (action === 'student-result') {
       const r = await api(`/attempts/${target.dataset.id}/result`);
       const scoreCard = document.getElementById('student-scorecard');
